@@ -327,6 +327,9 @@ class EmailScheduler:
 
             for snooze in due_snoozes:
                 try:
+                    # Move email back to inbox in Gmail
+                    self.router.move_to_inbox(snooze['message_id'])
+
                     # Build reminder message
                     gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{snooze['message_id']}"
 

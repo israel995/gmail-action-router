@@ -20,3 +20,4 @@ apscheduler>=3.10.0
 
 # AI Features (optional - only needed if using Claude API)
 anthropic>=0.18.0
+python-dateutil>=2.8.0

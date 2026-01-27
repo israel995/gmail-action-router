@@ -98,6 +98,26 @@ class Database:
                 )
             ''')
 
+            # Calendar invites tracking
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS calendar_invites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT UNIQUE NOT NULL,
+                    thread_id TEXT,
+                    subject TEXT,
+                    organizer TEXT,
+                    event_start TIMESTAMP,
+                    event_end TIMESTAMP,
+                    location TEXT,
+                    status TEXT,
+                    has_comments BOOLEAN DEFAULT FALSE,
+                    comments TEXT,
+                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    action_taken TEXT,
+                    my_response TEXT DEFAULT 'needs_action'
+                )
+            ''')
+
             # Create indexes for common queries
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_snoozed_remind_at ON snoozed_emails(remind_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_snoozed_reminded ON snoozed_emails(reminded)')
@@ -273,6 +293,77 @@ class Database:
             cursor.execute('SELECT summary FROM email_summaries WHERE message_id = ?', (message_id,))
             row = cursor.fetchone()
             return row['summary'] if row else None
+
+    # Calendar Invite Methods
+    def save_calendar_invite(self, message_id: str, thread_id: str = None,
+                             subject: str = None, organizer: str = None,
+                             event_start: datetime = None, event_end: datetime = None,
+                             location: str = None, status: str = None,
+                             has_comments: bool = False, comments: str = None,
+                             my_response: str = 'needs_action') -> int:
+        """Save or update a calendar invite."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO calendar_invites
+                (message_id, thread_id, subject, organizer, event_start, event_end,
+                 location, status, has_comments, comments, my_response)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (message_id, thread_id, subject, organizer, event_start, event_end,
+                  location, status, has_comments, comments, my_response))
+            return cursor.lastrowid
+
+    def get_calendar_invite(self, message_id: str) -> Optional[Dict]:
+        """Get a calendar invite by message ID."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM calendar_invites WHERE message_id = ?', (message_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_pending_invites(self) -> List[Dict]:
+        """Get all invites that need action."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM calendar_invites
+                WHERE my_response = 'needs_action' AND action_taken IS NULL
+                ORDER BY event_start ASC
+            ''')
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_invites_with_comments(self) -> List[Dict]:
+        """Get all invites that have comments."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM calendar_invites
+                WHERE has_comments = TRUE
+                ORDER BY event_start ASC
+            ''')
+            return [dict(row) for row in cursor.fetchall()]
+
+    def update_invite_action(self, message_id: str, action_taken: str, my_response: str = None):
+        """Update the action taken on an invite."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if my_response:
+                cursor.execute('''
+                    UPDATE calendar_invites
+                    SET action_taken = ?, my_response = ?
+                    WHERE message_id = ?
+                ''', (action_taken, my_response, message_id))
+            else:
+                cursor.execute('''
+                    UPDATE calendar_invites SET action_taken = ? WHERE message_id = ?
+                ''', (action_taken, message_id))
+
+    def is_invite_processed(self, message_id: str) -> bool:
+        """Check if an invite has already been processed."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT 1 FROM calendar_invites WHERE message_id = ?', (message_id,))
+            return cursor.fetchone() is not None
 
     # Statistics Methods
     def get_stats(self) -> Dict[str, Any]:

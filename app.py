@@ -124,6 +124,8 @@ def slack_commands():
         return handle_delegate_command(text, user_id, channel_id)
     elif command == '/email-stats':
         return handle_stats_command(user_id, channel_id)
+    elif command == '/invites':
+        return handle_invites_command(text, user_id, channel_id)
 
     return jsonify({
         'response_type': 'ephemeral',
@@ -164,9 +166,20 @@ def handle_block_actions(payload):
         elif action_id == 'reply_email':
             return open_reply_modal(payload.get('trigger_id'), message_id)
         elif action_id == 'snooze_email':
-            return open_snooze_modal(payload.get('trigger_id'), message_id)
+            return open_snooze_modal(payload.get('trigger_id'), message_id, channel, message)
         elif action_id == 'delegate_email':
             return open_delegate_modal(payload.get('trigger_id'), message_id)
+        # Calendar invite actions
+        elif action_id == 'archive_invite':
+            return handle_archive_invite(message_id, user, channel, message)
+        elif action_id == 'reply_invite':
+            return open_reply_modal(payload.get('trigger_id'), message_id)
+        elif action_id == 'archive_all_invites':
+            return handle_archive_all_invites(message_id, user, channel, message)
+        elif action_id == 'accept_invite':
+            return handle_accept_invite(message_id, user, channel, message)
+        elif action_id == 'decline_invite':
+            return handle_decline_invite(message_id, user, channel, message)
 
     return jsonify({'ok': True})
 
@@ -183,7 +196,8 @@ def handle_view_submission(payload):
         return handle_reply_submission(message_id, values, user)
     elif callback_id.startswith('snooze_modal_'):
         message_id = callback_id.replace('snooze_modal_', '')
-        return handle_snooze_submission(message_id, values, user)
+        metadata = json.loads(view.get('private_metadata', '{}'))
+        return handle_snooze_submission(message_id, values, user, metadata)
     elif callback_id.startswith('delegate_modal_'):
         message_id = callback_id.replace('delegate_modal_', '')
         return handle_delegate_submission(message_id, values, user)
@@ -225,6 +239,206 @@ def handle_archive_action(message_id, user, channel, message):
                 'response_type': 'ephemeral',
                 'text': "Failed to archive email. Please try again."
             })
+    except Exception as e:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': f"Error: {str(e)}"
+        })
+
+
+def handle_archive_invite(message_id, user, channel, message):
+    """Archive a calendar invite and update Slack message."""
+    try:
+        r = get_router()
+        success = r.archive_email(message_id)
+
+        if success:
+            # Update the Slack message
+            client = get_slack_client()
+            if client and message.get('ts'):
+                client.chat_update(
+                    channel=channel.get('id'),
+                    ts=message.get('ts'),
+                    text="Invite archived",
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"📁 *Invite archived* by <@{user.get('id')}>"
+                            }
+                        }
+                    ]
+                )
+
+            # Track in database
+            db.update_invite_action(message_id, 'archived')
+
+            return jsonify({'ok': True})
+        else:
+            return jsonify({
+                'response_type': 'ephemeral',
+                'text': "Failed to archive invite. Please try again."
+            })
+    except Exception as e:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': f"Error: {str(e)}"
+        })
+
+
+def handle_accept_invite(message_id, user, channel, message):
+    """Accept a calendar invite and archive the email."""
+    try:
+        r = get_router()
+        client = get_slack_client()
+
+        # Get email details for calendar matching
+        email = r.get_email_by_id(message_id)
+        subject = ""
+        if email:
+            headers = email.get('payload', {}).get('headers', [])
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '')
+
+        # Try to accept via Calendar API
+        calendar_success = False
+        try:
+            from calendar_integration import calendar
+            if calendar.authenticate():
+                calendar_success = calendar.accept_event(subject)
+        except Exception as e:
+            print(f"Calendar accept failed: {e}")
+
+        # Archive the email regardless
+        r.archive_email(message_id)
+
+        # Update Slack message
+        if client and message.get('ts'):
+            status_text = "✅ *Accepted & archived*" if calendar_success else "✅ *Archived* (calendar update may require manual confirmation)"
+            client.chat_update(
+                channel=channel.get('id'),
+                ts=message.get('ts'),
+                text="Invite accepted",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"{status_text} by <@{user.get('id')}>\n_{subject}_"
+                        }
+                    }
+                ]
+            )
+
+        # Track in database
+        db.update_invite_action(message_id, 'accepted', my_response='accepted')
+
+        return jsonify({'ok': True})
+
+    except Exception as e:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': f"Error: {str(e)}"
+        })
+
+
+def handle_decline_invite(message_id, user, channel, message):
+    """Decline a calendar invite and archive the email."""
+    try:
+        r = get_router()
+        client = get_slack_client()
+
+        # Get email details for calendar matching
+        email = r.get_email_by_id(message_id)
+        subject = ""
+        if email:
+            headers = email.get('payload', {}).get('headers', [])
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '')
+
+        # Try to decline via Calendar API
+        calendar_success = False
+        try:
+            from calendar_integration import calendar
+            if calendar.authenticate():
+                calendar_success = calendar.decline_event(subject)
+        except Exception as e:
+            print(f"Calendar decline failed: {e}")
+
+        # Archive the email regardless
+        r.archive_email(message_id)
+
+        # Update Slack message
+        if client and message.get('ts'):
+            status_text = "❌ *Declined & archived*" if calendar_success else "❌ *Archived* (calendar update may require manual confirmation)"
+            client.chat_update(
+                channel=channel.get('id'),
+                ts=message.get('ts'),
+                text="Invite declined",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"{status_text} by <@{user.get('id')}>\n_{subject}_"
+                        }
+                    }
+                ]
+            )
+
+        # Track in database
+        db.update_invite_action(message_id, 'declined', my_response='declined')
+
+        return jsonify({'ok': True})
+
+    except Exception as e:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': f"Error: {str(e)}"
+        })
+
+
+def handle_archive_all_invites(invite_ids_str, user, channel, message):
+    """Archive all calendar invites (bulk action)."""
+    try:
+        invite_ids = invite_ids_str.split(',') if invite_ids_str else []
+        r = get_router()
+        client = get_slack_client()
+
+        archived_count = 0
+        failed_count = 0
+
+        for message_id in invite_ids:
+            message_id = message_id.strip()
+            if not message_id:
+                continue
+            try:
+                if r.archive_email(message_id):
+                    db.update_invite_action(message_id, 'archived')
+                    archived_count += 1
+                else:
+                    failed_count += 1
+            except Exception:
+                failed_count += 1
+
+        # Update the Slack message
+        if client and message.get('ts'):
+            client.chat_update(
+                channel=channel.get('id'),
+                ts=message.get('ts'),
+                text="Invites archived",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"✅ *{archived_count} invites archived* by <@{user.get('id')}>"
+                                   + (f"\n⚠️ {failed_count} failed" if failed_count > 0 else "")
+                        }
+                    }
+                ]
+            )
+
+        return jsonify({'ok': True})
     except Exception as e:
         return jsonify({
             'response_type': 'ephemeral',
@@ -340,13 +554,20 @@ def open_reply_modal(trigger_id, message_id):
         return jsonify({'ok': False, 'error': str(e)})
 
 
-def open_snooze_modal(trigger_id, message_id):
+def open_snooze_modal(trigger_id, message_id, channel=None, message=None):
     """Open the snooze time selection modal."""
     client = get_slack_client()
     if not client:
         return jsonify({'ok': False, 'error': 'Slack not configured'})
 
     try:
+        # Store channel and message info for updating after submission
+        metadata = {
+            "message_id": message_id,
+            "channel_id": channel.get('id') if channel else None,
+            "message_ts": message.get('ts') if message else None
+        }
+
         client.views_open(
             trigger_id=trigger_id,
             view={
@@ -371,17 +592,17 @@ def open_snooze_modal(trigger_id, message_id):
                             "action_id": "snooze_select",
                             "placeholder": {"type": "plain_text", "text": "Select duration"},
                             "options": [
-                                {"text": {"type": "plain_text", "text": "1 hour"}, "value": "1h"},
-                                {"text": {"type": "plain_text", "text": "3 hours"}, "value": "3h"},
                                 {"text": {"type": "plain_text", "text": "Tomorrow morning (9 AM)"}, "value": "tomorrow"},
                                 {"text": {"type": "plain_text", "text": "Next Monday (9 AM)"}, "value": "monday"},
-                                {"text": {"type": "plain_text", "text": "1 week"}, "value": "1w"}
+                                {"text": {"type": "plain_text", "text": "1 week"}, "value": "1w"},
+                                {"text": {"type": "plain_text", "text": "2 weeks"}, "value": "2w"},
+                                {"text": {"type": "plain_text", "text": "1 month"}, "value": "1m"}
                             ]
                         },
                         "label": {"type": "plain_text", "text": "Snooze until"}
                     }
                 ],
-                "private_metadata": json.dumps({"message_id": message_id})
+                "private_metadata": json.dumps(metadata)
             }
         )
         return jsonify({'ok': True})
@@ -509,10 +730,11 @@ def handle_reply_submission(message_id, values, user):
         })
 
 
-def handle_snooze_submission(message_id, values, user):
+def handle_snooze_submission(message_id, values, user, metadata=None):
     """Handle snooze modal submission."""
     try:
         duration = values.get('snooze_duration', {}).get('snooze_select', {}).get('selected_option', {}).get('value')
+        metadata = metadata or {}
 
         if not duration:
             return jsonify({
@@ -522,11 +744,7 @@ def handle_snooze_submission(message_id, values, user):
 
         # Calculate remind_at time
         now = datetime.now()
-        if duration == '1h':
-            remind_at = now + timedelta(hours=1)
-        elif duration == '3h':
-            remind_at = now + timedelta(hours=3)
-        elif duration == 'tomorrow':
+        if duration == 'tomorrow':
             tomorrow = now + timedelta(days=1)
             remind_at = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
         elif duration == 'monday':
@@ -537,8 +755,13 @@ def handle_snooze_submission(message_id, values, user):
             remind_at = next_monday.replace(hour=9, minute=0, second=0, microsecond=0)
         elif duration == '1w':
             remind_at = now + timedelta(weeks=1)
+        elif duration == '2w':
+            remind_at = now + timedelta(weeks=2)
+        elif duration == '1m':
+            remind_at = now + timedelta(days=30)
         else:
-            remind_at = now + timedelta(hours=1)
+            tomorrow = now + timedelta(days=1)
+            remind_at = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
 
         # Get email details
         r = get_router()
@@ -552,6 +775,9 @@ def handle_snooze_submission(message_id, values, user):
             sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
             snippet = email.get('snippet', '')
 
+        # Archive the email in Gmail (remove from inbox)
+        r.archive_email(message_id)
+
         # Store snooze in database
         db.snooze_email(
             message_id=message_id,
@@ -562,13 +788,27 @@ def handle_snooze_submission(message_id, values, user):
             snippet=snippet
         )
 
-        # Notify user
+        # Update the original Slack message to show snoozed status
         client = get_slack_client()
         if client:
-            client.chat_postMessage(
-                channel=Config.SLACK_CHANNEL,
-                text=f"⏰ <@{user.get('id')}> snoozed email until {remind_at.strftime('%b %d at %I:%M %p')}: {subject}"
-            )
+            channel_id = metadata.get('channel_id')
+            message_ts = metadata.get('message_ts')
+
+            if channel_id and message_ts:
+                client.chat_update(
+                    channel=channel_id,
+                    ts=message_ts,
+                    text="Email snoozed",
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"⏰ *Snoozed* by <@{user.get('id')}> until {remind_at.strftime('%b %d at %I:%M %p')}\n_{subject}_"
+                            }
+                        }
+                    ]
+                )
 
         return jsonify({'response_action': 'clear'})
 
@@ -827,6 +1067,81 @@ def handle_stats_command(user_id, channel_id):
             'response_type': 'ephemeral',
             'text': f"Error: {str(e)}"
         })
+
+
+def handle_invites_command(text, user_id, channel_id):
+    """Handle /invites slash command - fetch and display calendar invites."""
+    import threading
+
+    # Parse optional hours parameter
+    hours = 168  # Default to 7 days
+    if text:
+        try:
+            hours = int(text)
+        except ValueError:
+            pass
+
+    def process_invites_async():
+        """Process invites in background thread."""
+        try:
+            r = get_router()
+            client = get_slack_client()
+
+            # Send scanning message
+            if client:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"🔍 Scanning for calendar invites from the last {hours} hours..."
+                )
+
+            # Fetch ALL recent calendar invites (not just unprocessed)
+            invites = r.get_calendar_invites(hours_back=hours)
+
+            if not invites:
+                if client:
+                    client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"No calendar invites found in the last {hours} hours."
+                    )
+                return
+
+            # Send invites to Slack with full details
+            r.send_calendar_invites_to_slack(invites)
+
+            # Save new invites to database for tracking
+            import json
+            for invite in invites:
+                if not db.is_invite_processed(invite.message_id):
+                    db.save_calendar_invite(
+                        message_id=invite.message_id,
+                        thread_id=invite.thread_id,
+                        subject=invite.subject,
+                        organizer=invite.organizer,
+                        event_start=invite.event_start,
+                        event_end=invite.event_end,
+                        location=invite.location,
+                        status=invite.status.value,
+                        has_comments=invite.has_comments,
+                        comments=json.dumps(invite.comments) if invite.comments else None
+                    )
+
+        except Exception as e:
+            client = get_slack_client()
+            if client:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"Error fetching invites: {str(e)}"
+                )
+
+    # Start background thread
+    thread = threading.Thread(target=process_invites_async)
+    thread.start()
+
+    # Respond immediately to Slack
+    return jsonify({
+        'response_type': 'ephemeral',
+        'text': "Processing calendar invites..."
+    })
 
 
 def handle_dm_command(event):

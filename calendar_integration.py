@@ -314,5 +314,114 @@ class CalendarIntegration:
             return None
 
 
+    def respond_to_event(self, event_id: str, response: str) -> bool:
+        """
+        Respond to a calendar event (accept, decline, tentative).
+
+        Args:
+            event_id: The calendar event ID
+            response: 'accepted', 'declined', or 'tentative'
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.enabled:
+            return False
+
+        try:
+            # Get the event first
+            event = self.service.events().get(
+                calendarId='primary',
+                eventId=event_id
+            ).execute()
+
+            # Find current user in attendees and update response
+            # If user is the organizer, this won't work the same way
+            attendees = event.get('attendees', [])
+            for attendee in attendees:
+                if attendee.get('self', False):
+                    attendee['responseStatus'] = response
+                    break
+
+            # Update the event
+            self.service.events().update(
+                calendarId='primary',
+                eventId=event_id,
+                body=event
+            ).execute()
+
+            print(f"Responded '{response}' to event: {event.get('summary')}")
+            return True
+
+        except HttpError as e:
+            print(f"Error responding to event: {e}")
+            return False
+
+    def find_event_by_subject_and_time(self, subject: str, event_start: datetime = None,
+                                        time_window_hours: int = 24) -> Optional[str]:
+        """
+        Find a calendar event ID by matching subject and approximate time.
+
+        Returns the event ID if found, None otherwise.
+        """
+        if not self.enabled:
+            return None
+
+        try:
+            # Search in a time window around the event start
+            if event_start:
+                time_min = event_start - timedelta(hours=1)
+                time_max = event_start + timedelta(hours=time_window_hours)
+            else:
+                # If no start time, search next 30 days
+                time_min = datetime.now()
+                time_max = time_min + timedelta(days=30)
+
+            events_result = self.service.events().list(
+                calendarId='primary',
+                timeMin=time_min.isoformat() + 'Z',
+                timeMax=time_max.isoformat() + 'Z',
+                singleEvents=True,
+                orderBy='startTime',
+                maxResults=50
+            ).execute()
+
+            events = events_result.get('items', [])
+
+            # Try to match by subject (fuzzy match)
+            subject_lower = subject.lower()
+            # Remove common prefixes like "Invitation:", "Updated:", etc.
+            for prefix in ['invitation:', 'updated invitation:', 'canceled:', 'accepted:', 'declined:']:
+                if subject_lower.startswith(prefix):
+                    subject_lower = subject_lower[len(prefix):].strip()
+                    break
+
+            for event in events:
+                event_summary = event.get('summary', '').lower()
+                # Check if the subjects match (account for slight variations)
+                if subject_lower in event_summary or event_summary in subject_lower:
+                    return event.get('id')
+
+            return None
+
+        except HttpError as e:
+            print(f"Error finding event: {e}")
+            return None
+
+    def accept_event(self, subject: str, event_start: datetime = None) -> bool:
+        """Accept a calendar invite by subject."""
+        event_id = self.find_event_by_subject_and_time(subject, event_start)
+        if event_id:
+            return self.respond_to_event(event_id, 'accepted')
+        return False
+
+    def decline_event(self, subject: str, event_start: datetime = None) -> bool:
+        """Decline a calendar invite by subject."""
+        event_id = self.find_event_by_subject_and_time(subject, event_start)
+        if event_id:
+            return self.respond_to_event(event_id, 'declined')
+        return False
+
+
 # Singleton instance
 calendar = CalendarIntegration()
