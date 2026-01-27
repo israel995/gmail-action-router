@@ -1,7 +1,11 @@
 # Credentials and tokens
 credentials.json
 token.pickle
+calendar_token.pickle
 .env
+
+# Database
+email_agent.db
 
 # Claude Code
 CLAUDE.md

@@ -1,0 +1,881 @@
+#!/usr/bin/env python3
+"""
+Flask Web Server for Gmail Action Router
+Handles Slack webhooks for interactivity (buttons, slash commands, modals).
+"""
+
+import hashlib
+import hmac
+import json
+import time
+from datetime import datetime, timedelta
+from functools import wraps
+
+from flask import Flask, request, jsonify
+
+from config import Config
+from database import db
+from gmail_action_router import GmailActionRouter, Priority, Category
+
+# Lazy imports for optional dependencies
+slack_client = None
+router = None
+
+
+def get_slack_client():
+    """Get or create Slack client."""
+    global slack_client
+    if slack_client is None and Config.SLACK_BOT_TOKEN:
+        from slack_sdk import WebClient
+        slack_client = WebClient(token=Config.SLACK_BOT_TOKEN)
+    return slack_client
+
+
+def get_router():
+    """Get or create Gmail router (singleton)."""
+    global router
+    if router is None:
+        router = GmailActionRouter()
+        router.authenticate_gmail()
+        router.setup_slack()
+    return router
+
+
+app = Flask(__name__)
+
+
+def verify_slack_signature(f):
+    """Decorator to verify Slack request signatures."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not Config.SLACK_SIGNING_SECRET:
+            # Skip verification if not configured (dev mode)
+            return f(*args, **kwargs)
+
+        timestamp = request.headers.get('X-Slack-Request-Timestamp', '')
+        signature = request.headers.get('X-Slack-Signature', '')
+
+        # Check timestamp to prevent replay attacks
+        if abs(time.time() - int(timestamp)) > 60 * 5:
+            return jsonify({'error': 'Request too old'}), 403
+
+        # Verify signature
+        sig_basestring = f"v0:{timestamp}:{request.get_data(as_text=True)}"
+        my_signature = 'v0=' + hmac.new(
+            Config.SLACK_SIGNING_SECRET.encode(),
+            sig_basestring.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(my_signature, signature):
+            return jsonify({'error': 'Invalid signature'}), 403
+
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'ai_enabled': Config.is_ai_enabled(),
+        'slack_interactive': Config.is_slack_interactive_enabled()
+    })
+
+
+@app.route('/slack/events', methods=['POST'])
+@verify_slack_signature
+def slack_events():
+    """Handle Slack Events API."""
+    data = request.json
+
+    # Handle URL verification challenge
+    if data.get('type') == 'url_verification':
+        return jsonify({'challenge': data.get('challenge')})
+
+    # Handle events
+    event = data.get('event', {})
+    event_type = event.get('type')
+
+    if event_type == 'message' and event.get('channel_type') == 'im':
+        # Handle DM commands
+        handle_dm_command(event)
+
+    return jsonify({'ok': True})
+
+
+@app.route('/slack/commands', methods=['POST'])
+@verify_slack_signature
+def slack_commands():
+    """Handle Slack slash commands."""
+    command = request.form.get('command')
+    text = request.form.get('text', '')
+    user_id = request.form.get('user_id')
+    channel_id = request.form.get('channel_id')
+    response_url = request.form.get('response_url')
+
+    if command == '/digest':
+        return handle_digest_command(text, user_id, channel_id)
+    elif command == '/snooze':
+        return handle_snooze_command(text, user_id, channel_id)
+    elif command == '/delegate':
+        return handle_delegate_command(text, user_id, channel_id)
+    elif command == '/email-stats':
+        return handle_stats_command(user_id, channel_id)
+
+    return jsonify({
+        'response_type': 'ephemeral',
+        'text': f"Unknown command: {command}"
+    })
+
+
+@app.route('/slack/interactions', methods=['POST'])
+@verify_slack_signature
+def slack_interactions():
+    """Handle Slack interactive components (buttons, modals)."""
+    payload = json.loads(request.form.get('payload', '{}'))
+    interaction_type = payload.get('type')
+
+    if interaction_type == 'block_actions':
+        return handle_block_actions(payload)
+    elif interaction_type == 'view_submission':
+        return handle_view_submission(payload)
+    elif interaction_type == 'shortcut':
+        return handle_shortcut(payload)
+
+    return jsonify({'ok': True})
+
+
+def handle_block_actions(payload):
+    """Handle button clicks from Slack messages."""
+    actions = payload.get('actions', [])
+    user = payload.get('user', {})
+    channel = payload.get('channel', {})
+    message = payload.get('message', {})
+
+    for action in actions:
+        action_id = action.get('action_id')
+        message_id = action.get('value')
+
+        if action_id == 'archive_email':
+            return handle_archive_action(message_id, user, channel, message)
+        elif action_id == 'reply_email':
+            return open_reply_modal(payload.get('trigger_id'), message_id)
+        elif action_id == 'snooze_email':
+            return open_snooze_modal(payload.get('trigger_id'), message_id)
+        elif action_id == 'delegate_email':
+            return open_delegate_modal(payload.get('trigger_id'), message_id)
+
+    return jsonify({'ok': True})
+
+
+def handle_view_submission(payload):
+    """Handle modal form submissions."""
+    view = payload.get('view', {})
+    callback_id = view.get('callback_id', '')
+    user = payload.get('user', {})
+    values = view.get('state', {}).get('values', {})
+
+    if callback_id.startswith('reply_modal_'):
+        message_id = callback_id.replace('reply_modal_', '')
+        return handle_reply_submission(message_id, values, user)
+    elif callback_id.startswith('snooze_modal_'):
+        message_id = callback_id.replace('snooze_modal_', '')
+        return handle_snooze_submission(message_id, values, user)
+    elif callback_id.startswith('delegate_modal_'):
+        message_id = callback_id.replace('delegate_modal_', '')
+        return handle_delegate_submission(message_id, values, user)
+
+    return jsonify({'ok': True})
+
+
+def handle_archive_action(message_id, user, channel, message):
+    """Archive an email and update Slack message."""
+    try:
+        r = get_router()
+        success = r.archive_email(message_id)
+
+        if success:
+            # Update the Slack message to show archived status
+            client = get_slack_client()
+            if client and message.get('ts'):
+                client.chat_update(
+                    channel=channel.get('id'),
+                    ts=message.get('ts'),
+                    text="Email archived",
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"✅ *Archived* by <@{user.get('id')}>"
+                            }
+                        }
+                    ]
+                )
+
+            # Track in database
+            db.mark_email_processed(message_id, action_taken='archived')
+
+            return jsonify({'ok': True})
+        else:
+            return jsonify({
+                'response_type': 'ephemeral',
+                'text': "Failed to archive email. Please try again."
+            })
+    except Exception as e:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': f"Error: {str(e)}"
+        })
+
+
+def open_reply_modal(trigger_id, message_id):
+    """Open the reply composition modal."""
+    client = get_slack_client()
+    if not client:
+        return jsonify({'ok': False, 'error': 'Slack not configured'})
+
+    try:
+        # Get email details for context
+        r = get_router()
+        email = r.get_email_by_id(message_id)
+        subject = ""
+        sender = ""
+        if email:
+            headers = email.get('payload', {}).get('headers', [])
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '')
+            sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
+
+        # Try to get AI-suggested replies if available
+        suggested_replies = []
+        if Config.is_ai_enabled():
+            try:
+                from ai_assistant import AIAssistant
+                ai = AIAssistant()
+                body = r.get_email_body(email) if email else ""
+                suggested_replies = ai.generate_reply_suggestions(subject, sender, body)
+            except Exception:
+                pass
+
+        # Build modal blocks
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Replying to:* {subject}\n*From:* {sender}"
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "reply_text",
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "reply_input",
+                    "multiline": True,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Type your reply here..."
+                    }
+                },
+                "label": {
+                    "type": "plain_text",
+                    "text": "Your Reply"
+                }
+            }
+        ]
+
+        # Add suggested replies if available
+        if suggested_replies:
+            options = [
+                {
+                    "text": {"type": "plain_text", "text": reply[:75] + "..." if len(reply) > 75 else reply},
+                    "value": reply
+                }
+                for reply in suggested_replies[:3]
+            ]
+            blocks.insert(1, {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "🤖 *AI Suggested Replies:*"
+                }
+            })
+            blocks.insert(2, {
+                "type": "actions",
+                "block_id": "suggested_replies",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": f"Option {i+1}"},
+                        "action_id": f"use_suggestion_{i}",
+                        "value": reply
+                    }
+                    for i, reply in enumerate(suggested_replies[:3])
+                ]
+            })
+
+        client.views_open(
+            trigger_id=trigger_id,
+            view={
+                "type": "modal",
+                "callback_id": f"reply_modal_{message_id}",
+                "title": {"type": "plain_text", "text": "Reply to Email"},
+                "submit": {"type": "plain_text", "text": "Send Reply"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "blocks": blocks,
+                "private_metadata": json.dumps({
+                    "message_id": message_id,
+                    "subject": subject,
+                    "sender": sender
+                })
+            }
+        )
+        return jsonify({'ok': True})
+
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+def open_snooze_modal(trigger_id, message_id):
+    """Open the snooze time selection modal."""
+    client = get_slack_client()
+    if not client:
+        return jsonify({'ok': False, 'error': 'Slack not configured'})
+
+    try:
+        client.views_open(
+            trigger_id=trigger_id,
+            view={
+                "type": "modal",
+                "callback_id": f"snooze_modal_{message_id}",
+                "title": {"type": "plain_text", "text": "Snooze Email"},
+                "submit": {"type": "plain_text", "text": "Snooze"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "When would you like to be reminded about this email?"
+                        }
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "snooze_duration",
+                        "element": {
+                            "type": "static_select",
+                            "action_id": "snooze_select",
+                            "placeholder": {"type": "plain_text", "text": "Select duration"},
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "1 hour"}, "value": "1h"},
+                                {"text": {"type": "plain_text", "text": "3 hours"}, "value": "3h"},
+                                {"text": {"type": "plain_text", "text": "Tomorrow morning (9 AM)"}, "value": "tomorrow"},
+                                {"text": {"type": "plain_text", "text": "Next Monday (9 AM)"}, "value": "monday"},
+                                {"text": {"type": "plain_text", "text": "1 week"}, "value": "1w"}
+                            ]
+                        },
+                        "label": {"type": "plain_text", "text": "Snooze until"}
+                    }
+                ],
+                "private_metadata": json.dumps({"message_id": message_id})
+            }
+        )
+        return jsonify({'ok': True})
+
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+def open_delegate_modal(trigger_id, message_id):
+    """Open the delegation modal."""
+    client = get_slack_client()
+    if not client:
+        return jsonify({'ok': False, 'error': 'Slack not configured'})
+
+    try:
+        client.views_open(
+            trigger_id=trigger_id,
+            view={
+                "type": "modal",
+                "callback_id": f"delegate_modal_{message_id}",
+                "title": {"type": "plain_text", "text": "Delegate Email"},
+                "submit": {"type": "plain_text", "text": "Delegate"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "delegate_to",
+                        "element": {
+                            "type": "users_select",
+                            "action_id": "user_select",
+                            "placeholder": {"type": "plain_text", "text": "Select a person"}
+                        },
+                        "label": {"type": "plain_text", "text": "Delegate to"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "delegate_notes",
+                        "optional": True,
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "notes_input",
+                            "multiline": True,
+                            "placeholder": {"type": "plain_text", "text": "Add any notes or instructions..."}
+                        },
+                        "label": {"type": "plain_text", "text": "Notes"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "delegate_due",
+                        "optional": True,
+                        "element": {
+                            "type": "datepicker",
+                            "action_id": "due_date",
+                            "placeholder": {"type": "plain_text", "text": "Select a date"}
+                        },
+                        "label": {"type": "plain_text", "text": "Due Date"}
+                    }
+                ],
+                "private_metadata": json.dumps({"message_id": message_id})
+            }
+        )
+        return jsonify({'ok': True})
+
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+def handle_reply_submission(message_id, values, user):
+    """Handle reply modal submission."""
+    try:
+        reply_text = values.get('reply_text', {}).get('reply_input', {}).get('value', '')
+
+        if not reply_text:
+            return jsonify({
+                'response_action': 'errors',
+                'errors': {'reply_text': 'Please enter a reply message'}
+            })
+
+        r = get_router()
+        email = r.get_email_by_id(message_id)
+
+        if not email:
+            return jsonify({
+                'response_action': 'errors',
+                'errors': {'reply_text': 'Could not find the original email'}
+            })
+
+        # Get email details
+        headers = email.get('payload', {}).get('headers', [])
+        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '')
+        sender_email = r.get_sender_email(email)
+        thread_id = email.get('threadId')
+
+        # Send the reply
+        success = r.send_reply(
+            message_id=message_id,
+            thread_id=thread_id,
+            to_email=sender_email,
+            subject=subject,
+            body=reply_text
+        )
+
+        if success:
+            db.mark_email_processed(message_id, action_taken='replied')
+
+            # Notify in channel
+            client = get_slack_client()
+            if client:
+                client.chat_postMessage(
+                    channel=Config.SLACK_CHANNEL,
+                    text=f"✉️ <@{user.get('id')}> replied to: {subject}"
+                )
+
+            return jsonify({'response_action': 'clear'})
+        else:
+            return jsonify({
+                'response_action': 'errors',
+                'errors': {'reply_text': 'Failed to send reply. Please try again.'}
+            })
+
+    except Exception as e:
+        return jsonify({
+            'response_action': 'errors',
+            'errors': {'reply_text': f'Error: {str(e)}'}
+        })
+
+
+def handle_snooze_submission(message_id, values, user):
+    """Handle snooze modal submission."""
+    try:
+        duration = values.get('snooze_duration', {}).get('snooze_select', {}).get('selected_option', {}).get('value')
+
+        if not duration:
+            return jsonify({
+                'response_action': 'errors',
+                'errors': {'snooze_duration': 'Please select a snooze duration'}
+            })
+
+        # Calculate remind_at time
+        now = datetime.now()
+        if duration == '1h':
+            remind_at = now + timedelta(hours=1)
+        elif duration == '3h':
+            remind_at = now + timedelta(hours=3)
+        elif duration == 'tomorrow':
+            tomorrow = now + timedelta(days=1)
+            remind_at = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
+        elif duration == 'monday':
+            days_ahead = 7 - now.weekday()
+            if days_ahead <= 0:
+                days_ahead += 7
+            next_monday = now + timedelta(days=days_ahead)
+            remind_at = next_monday.replace(hour=9, minute=0, second=0, microsecond=0)
+        elif duration == '1w':
+            remind_at = now + timedelta(weeks=1)
+        else:
+            remind_at = now + timedelta(hours=1)
+
+        # Get email details
+        r = get_router()
+        email = r.get_email_by_id(message_id)
+        subject = ""
+        sender = ""
+        snippet = ""
+        if email:
+            headers = email.get('payload', {}).get('headers', [])
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '')
+            sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
+            snippet = email.get('snippet', '')
+
+        # Store snooze in database
+        db.snooze_email(
+            message_id=message_id,
+            remind_at=remind_at,
+            thread_id=email.get('threadId') if email else None,
+            subject=subject,
+            sender=sender,
+            snippet=snippet
+        )
+
+        # Notify user
+        client = get_slack_client()
+        if client:
+            client.chat_postMessage(
+                channel=Config.SLACK_CHANNEL,
+                text=f"⏰ <@{user.get('id')}> snoozed email until {remind_at.strftime('%b %d at %I:%M %p')}: {subject}"
+            )
+
+        return jsonify({'response_action': 'clear'})
+
+    except Exception as e:
+        return jsonify({
+            'response_action': 'errors',
+            'errors': {'snooze_duration': f'Error: {str(e)}'}
+        })
+
+
+def handle_delegate_submission(message_id, values, user):
+    """Handle delegate modal submission."""
+    try:
+        delegate_to = values.get('delegate_to', {}).get('user_select', {}).get('selected_user')
+        notes = values.get('delegate_notes', {}).get('notes_input', {}).get('value', '')
+        due_date_str = values.get('delegate_due', {}).get('due_date', {}).get('selected_date')
+
+        if not delegate_to:
+            return jsonify({
+                'response_action': 'errors',
+                'errors': {'delegate_to': 'Please select someone to delegate to'}
+            })
+
+        # Parse due date
+        due_date = None
+        if due_date_str:
+            due_date = datetime.strptime(due_date_str, '%Y-%m-%d')
+
+        # Get email details
+        r = get_router()
+        email = r.get_email_by_id(message_id)
+        subject = ""
+        sender = ""
+        if email:
+            headers = email.get('payload', {}).get('headers', [])
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '')
+            sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
+
+        # Store delegation in database
+        db.delegate_email(
+            message_id=message_id,
+            delegated_to=delegate_to,
+            thread_id=email.get('threadId') if email else None,
+            subject=subject,
+            sender=sender,
+            due_date=due_date,
+            notes=notes
+        )
+
+        # Notify the assignee
+        client = get_slack_client()
+        if client:
+            gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{message_id}"
+            due_text = f"\n*Due:* {due_date.strftime('%b %d, %Y')}" if due_date else ""
+
+            client.chat_postMessage(
+                channel=delegate_to,  # DM the assignee
+                text=f"📋 <@{user.get('id')}> delegated an email to you",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"📋 *New Delegated Task* from <@{user.get('id')}>"
+                        }
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
+                            {"type": "mrkdwn", "text": f"*Subject:*\n{subject}"},
+                            {"type": "mrkdwn", "text": f"*From:*\n{sender}"}
+                        ]
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Notes:*\n{notes or 'No notes provided'}{due_text}"
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "Open Email"},
+                                "url": gmail_link,
+                                "style": "primary"
+                            }
+                        ]
+                    }
+                ]
+            )
+
+            # Also post to delegation channel if configured
+            if Config.DELEGATION_CHANNEL:
+                client.chat_postMessage(
+                    channel=Config.DELEGATION_CHANNEL,
+                    text=f"📋 <@{user.get('id')}> delegated \"{subject}\" to <@{delegate_to}>{due_text}"
+                )
+
+        return jsonify({'response_action': 'clear'})
+
+    except Exception as e:
+        return jsonify({
+            'response_action': 'errors',
+            'errors': {'delegate_to': f'Error: {str(e)}'}
+        })
+
+
+def handle_digest_command(text, user_id, channel_id):
+    """Handle /digest slash command."""
+    try:
+        # Parse optional parameters
+        hours = Config.DEFAULT_SCAN_HOURS
+        if text:
+            try:
+                hours = int(text)
+            except ValueError:
+                pass
+
+        r = get_router()
+        messages = r.get_unread_emails(hours_back=hours)
+
+        if not messages:
+            return jsonify({
+                'response_type': 'ephemeral',
+                'text': f"No unread emails in the last {hours} hours."
+            })
+
+        # Parse and categorize emails
+        actions = []
+        for msg in messages:
+            action = r.parse_email(msg)
+            if action:
+                actions.append(action)
+
+        if not actions:
+            return jsonify({
+                'response_type': 'ephemeral',
+                'text': "No actionable emails found."
+            })
+
+        # Group by priority
+        by_priority = {}
+        for action in actions:
+            if action.priority not in by_priority:
+                by_priority[action.priority] = []
+            by_priority[action.priority].append(action)
+
+        # Build summary
+        summary_lines = [f"*📧 Email Digest* ({len(actions)} emails)\n"]
+
+        for priority in [Priority.URGENT, Priority.HIGH, Priority.MEDIUM, Priority.LOW]:
+            if priority in by_priority:
+                count = len(by_priority[priority])
+                summary_lines.append(f"{priority.value}: {count}")
+
+        # Add category breakdown
+        by_category = {}
+        for action in actions:
+            cat = action.category.value
+            by_category[cat] = by_category.get(cat, 0) + 1
+
+        summary_lines.append("\n*By Category:*")
+        for cat, count in by_category.items():
+            summary_lines.append(f"• {cat.title()}: {count}")
+
+        return jsonify({
+            'response_type': 'in_channel',
+            'text': '\n'.join(summary_lines)
+        })
+
+    except Exception as e:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': f"Error generating digest: {str(e)}"
+        })
+
+
+def handle_snooze_command(text, user_id, channel_id):
+    """Handle /snooze slash command - list active snoozes."""
+    try:
+        snoozes = db.get_active_snoozes()
+
+        if not snoozes:
+            return jsonify({
+                'response_type': 'ephemeral',
+                'text': "No active snoozes."
+            })
+
+        lines = ["*⏰ Active Snoozes:*\n"]
+        for snooze in snoozes:
+            remind_at = datetime.fromisoformat(snooze['remind_at'])
+            lines.append(f"• {snooze['subject'][:40]}... → {remind_at.strftime('%b %d, %I:%M %p')}")
+
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': '\n'.join(lines)
+        })
+
+    except Exception as e:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': f"Error: {str(e)}"
+        })
+
+
+def handle_delegate_command(text, user_id, channel_id):
+    """Handle /delegate slash command - list pending delegations."""
+    try:
+        delegations = db.get_pending_delegations()
+
+        if not delegations:
+            return jsonify({
+                'response_type': 'ephemeral',
+                'text': "No pending delegations."
+            })
+
+        lines = ["*📋 Pending Delegations:*\n"]
+        for d in delegations:
+            due_text = ""
+            if d['due_date']:
+                due = datetime.fromisoformat(d['due_date'])
+                due_text = f" (due {due.strftime('%b %d')})"
+            lines.append(f"• {d['subject'][:40]}... → <@{d['delegated_to']}>{due_text}")
+
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': '\n'.join(lines)
+        })
+
+    except Exception as e:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': f"Error: {str(e)}"
+        })
+
+
+def handle_stats_command(user_id, channel_id):
+    """Handle /email-stats slash command."""
+    try:
+        stats = db.get_stats()
+
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': f"*📊 Email Agent Stats:*\n"
+                   f"• Processed emails: {stats['processed_emails']}\n"
+                   f"• Active snoozes: {stats['active_snoozes']}\n"
+                   f"• Pending delegations: {stats['pending_delegations']}\n"
+                   f"• Cached AI summaries: {stats['cached_summaries']}"
+        })
+
+    except Exception as e:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': f"Error: {str(e)}"
+        })
+
+
+def handle_dm_command(event):
+    """Handle DM commands to the bot."""
+    text = event.get('text', '').lower().strip()
+    user = event.get('user')
+
+    client = get_slack_client()
+    if not client:
+        return
+
+    if text == 'digest':
+        handle_digest_command('', user, event.get('channel'))
+    elif text == 'snoozes':
+        snoozes = db.get_active_snoozes()
+        if snoozes:
+            msg = "Your active snoozes:\n"
+            for s in snoozes:
+                remind_at = datetime.fromisoformat(s['remind_at'])
+                msg += f"• {s['subject'][:40]}... → {remind_at.strftime('%b %d, %I:%M %p')}\n"
+        else:
+            msg = "No active snoozes."
+        client.chat_postMessage(channel=event.get('channel'), text=msg)
+    elif text == 'help':
+        client.chat_postMessage(
+            channel=event.get('channel'),
+            text="*Available commands:*\n"
+                 "• `digest` - Get email summary\n"
+                 "• `snoozes` - List active snoozes\n"
+                 "• `help` - Show this message"
+        )
+
+
+def handle_shortcut(payload):
+    """Handle global shortcuts."""
+    callback_id = payload.get('callback_id')
+    # Future: implement global shortcuts like "quick_digest"
+    return jsonify({'ok': True})
+
+
+if __name__ == '__main__':
+    print("Starting Gmail Action Router Web Server...")
+    print(f"AI Features: {'Enabled' if Config.is_ai_enabled() else 'Disabled'}")
+    print(f"Slack Interactive: {'Enabled' if Config.is_slack_interactive_enabled() else 'Disabled'}")
+    print(f"\nServer running on http://{Config.FLASK_HOST}:{Config.FLASK_PORT}")
+    print("Use ngrok to expose this server for Slack webhooks:")
+    print(f"  ngrok http {Config.FLASK_PORT}")
+    app.run(
+        host=Config.FLASK_HOST,
+        port=Config.FLASK_PORT,
+        debug=Config.FLASK_DEBUG
+    )

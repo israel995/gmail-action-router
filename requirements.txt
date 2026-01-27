@@ -11,3 +11,12 @@ twilio>=8.0.0
 
 # Utilities
 python-dotenv>=0.19.0
+
+# Web Server (for Slack interactivity)
+flask>=2.0.0
+
+# Scheduler (for automated tasks)
+apscheduler>=3.10.0
+
+# AI Features (optional - only needed if using Claude API)
+anthropic>=0.18.0
