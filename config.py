@@ -58,6 +58,9 @@ class Config:
     DAILY_DIGEST_HOUR = int(os.getenv('DAILY_DIGEST_HOUR', '7'))
     DAILY_DIGEST_MINUTE = int(os.getenv('DAILY_DIGEST_MINUTE', '0'))
     SNOOZE_CHECK_INTERVAL_MINUTES = int(os.getenv('SNOOZE_CHECK_INTERVAL_MINUTES', '15'))
+    FAMILY_SUMMARY_HOUR = int(os.getenv('FAMILY_SUMMARY_HOUR', '20'))  # 8 PM
+    FAMILY_SUMMARY_MINUTE = int(os.getenv('FAMILY_SUMMARY_MINUTE', '0'))
+    FAMILY_SUMMARY_DAYS = int(os.getenv('FAMILY_SUMMARY_DAYS', '1'))  # Look back 1 day by default
 
     # Sender Lists (comma-separated in env)
     IMPORTANT_SENDERS = [
@@ -83,6 +86,21 @@ class Config:
         'daycare', 'school', 'doctor', 'appointment', 'pediatrician',
         'dentist', 'pharmacy', 'prescription', 'pickup', 'drop-off',
         'parent', 'family', 'kid', 'child', 'health', 'insurance claim',
+    ]
+
+    # Family Senders - schools, daycares, activities (domains/partial matches)
+    FAMILY_SENDERS = [
+        s.strip() for s in os.getenv('FAMILY_SENDERS', '').split(',') if s.strip()
+    ] or [
+        # Daycares/Preschools
+        'kaymbu.com',
+        'preschoolsmiles.com',
+        # Schools
+        'nvnet.org',
+        'demarestpublicschools',
+        'membershiptoolkit.com',
+        # Nature Centers / Community
+        'dmsnews-nvnet.org',
     ]
 
     @classmethod

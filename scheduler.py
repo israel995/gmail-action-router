@@ -94,6 +94,18 @@ class EmailScheduler:
             replace_existing=True
         )
 
+        # Family announcements summary - daily at 8 PM
+        self.scheduler.add_job(
+            self.send_family_summary,
+            CronTrigger(
+                hour=Config.FAMILY_SUMMARY_HOUR,
+                minute=Config.FAMILY_SUMMARY_MINUTE
+            ),
+            id='family_summary',
+            name='Family Announcements Summary',
+            replace_existing=True
+        )
+
         print(f"Scheduled jobs:")
         for job in self.scheduler.get_jobs():
             print(f"  - {job.name}: {job.trigger}")
@@ -453,6 +465,220 @@ class EmailScheduler:
 
         except Exception as e:
             print(f"Error checking delegations: {e}")
+
+    def send_family_summary(self):
+        """Send daily family announcements summary."""
+        if not self.slack_client or not self.router:
+            return
+
+        try:
+            print(f"[{datetime.now()}] Generating family summary...")
+
+            days = Config.FAMILY_SUMMARY_DAYS
+            family_senders = Config.FAMILY_SENDERS
+
+            if not family_senders:
+                print("No family senders configured")
+                return
+
+            # Build query for family senders
+            sender_queries = ' OR '.join([f'from:{sender}' for sender in family_senders])
+            hours_back = days * 24
+
+            after_date = datetime.now() - timedelta(hours=hours_back)
+            after_timestamp = int(after_date.timestamp())
+            query = f'({sender_queries}) after:{after_timestamp}'
+
+            # Fetch emails
+            results = self.router.gmail_service.users().messages().list(
+                userId='me',
+                q=query,
+                maxResults=50
+            ).execute()
+
+            messages = results.get('messages', [])
+
+            if not messages:
+                self.slack_client.chat_postMessage(
+                    channel=Config.SLACK_CHANNEL,
+                    text=f"👨‍👩‍👧‍👦 No family announcements in the last {days} day(s)."
+                )
+                return
+
+            # Get full details for each email
+            emails_data = []
+            for msg in messages:
+                msg_detail = self.router.gmail_service.users().messages().get(
+                    userId='me',
+                    id=msg['id'],
+                    format='full'
+                ).execute()
+
+                headers = msg_detail.get('payload', {}).get('headers', [])
+                subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '')
+                sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
+                date_str = next((h['value'] for h in headers if h['name'] == 'Date'), '')
+
+                body = self.router.get_email_body(msg_detail)[:2000]
+
+                emails_data.append({
+                    'message_id': msg['id'],
+                    'subject': subject,
+                    'sender': sender,
+                    'date': date_str,
+                    'body': body,
+                    'snippet': msg_detail.get('snippet', '')
+                })
+
+            # Send header
+            self.slack_client.chat_postMessage(
+                channel=Config.SLACK_CHANNEL,
+                text="Family Announcements Summary",
+                blocks=[
+                    {
+                        "type": "header",
+                        "text": {"type": "plain_text", "text": "👨‍👩‍👧‍👦 Family Announcements Summary"}
+                    },
+                    {
+                        "type": "context",
+                        "elements": [{"type": "mrkdwn", "text": f"_{len(emails_data)} emails from today_"}]
+                    }
+                ]
+            )
+
+            # Generate and send AI summary if available
+            if Config.is_ai_enabled():
+                self._send_family_sections(emails_data)
+            else:
+                # Basic list without AI
+                for email in emails_data[:10]:
+                    gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{email['message_id']}"
+                    sender_name = email['sender'].split('<')[0].strip().strip('"') if '<' in email['sender'] else email['sender']
+                    self.slack_client.chat_postMessage(
+                        channel=Config.SLACK_CHANNEL,
+                        text=email['subject'],
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {"type": "mrkdwn", "text": f"*{email['subject'][:60]}*\n_{sender_name}_"},
+                                "accessory": {
+                                    "type": "button",
+                                    "text": {"type": "plain_text", "text": "Open"},
+                                    "url": gmail_link
+                                }
+                            }
+                        ]
+                    )
+
+            print(f"[{datetime.now()}] Family summary sent: {len(emails_data)} emails")
+
+        except Exception as e:
+            print(f"Error sending family summary: {e}")
+
+    def _send_family_sections(self, emails_data):
+        """Generate AI summary and send sections to Slack."""
+        import json
+        from anthropic import Anthropic
+
+        try:
+            client = Anthropic(api_key=Config.ANTHROPIC_API_KEY)
+
+            # Prepare email content with index references
+            email_texts = []
+            for i, email in enumerate(emails_data):
+                email_texts.append(f"""
+[EMAIL_{i}]
+From: {email['sender']}
+Subject: {email['subject']}
+Content: {email['body'][:1500]}
+---""")
+
+            prompt = f"""Analyze these family/school emails and categorize the important information.
+
+Return a JSON object with these sections. Each item should reference which email it came from using the EMAIL_X index.
+
+{{
+  "action_required": [{{"text": "description", "email_index": 0}}],
+  "upcoming_dates": [{{"text": "description", "email_index": 1}}],
+  "important_changes": [{{"text": "description", "email_index": 2}}],
+  "announcements": [{{"text": "description", "email_index": 3}}]
+}}
+
+Rules:
+- Only include items actually mentioned in the emails
+- Be concise but specific (include dates, deadlines when mentioned)
+- If a section has no items, use an empty array []
+- email_index must match the EMAIL_X number from the source email
+
+Emails:
+{''.join(email_texts)}
+
+Return ONLY the JSON object."""
+
+            response = client.messages.create(
+                model=Config.AI_MODEL,
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            # Parse JSON
+            response_text = response.content[0].text.strip()
+            if response_text.startswith('```'):
+                response_text = response_text.split('```')[1]
+                if response_text.startswith('json'):
+                    response_text = response_text[4:]
+            sections = json.loads(response_text)
+
+            # Send each section
+            section_config = [
+                ("action_required", "🚨 Action Required"),
+                ("upcoming_dates", "📅 Upcoming Dates"),
+                ("important_changes", "⚠️ Important Changes"),
+                ("announcements", "📢 Announcements"),
+            ]
+
+            for section_key, section_title in section_config:
+                items = sections.get(section_key, [])
+                if not items:
+                    continue
+
+                bullet_text = ""
+                email_indices = []
+                for item in items:
+                    bullet_text += f"• {item.get('text', '')}\n"
+                    idx = item.get('email_index')
+                    if idx is not None and idx not in email_indices:
+                        email_indices.append(idx)
+
+                self.slack_client.chat_postMessage(
+                    channel=Config.SLACK_CHANNEL,
+                    text=section_title,
+                    blocks=[
+                        {"type": "header", "text": {"type": "plain_text", "text": section_title}},
+                        {"type": "section", "text": {"type": "mrkdwn", "text": bullet_text}},
+                        {"type": "divider"}
+                    ]
+                )
+
+                for idx in email_indices:
+                    if idx < len(emails_data):
+                        email = emails_data[idx]
+                        gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{email['message_id']}"
+                        sender_name = email['sender'].split('<')[0].strip().strip('"') if '<' in email['sender'] else email['sender']
+                        self.slack_client.chat_postMessage(
+                            channel=Config.SLACK_CHANNEL,
+                            text=email['subject'],
+                            blocks=[
+                                {
+                                    "type": "section",
+                                    "text": {"type": "mrkdwn", "text": f"*{email['subject'][:60]}*\n_{sender_name}_"},
+                                    "accessory": {"type": "button", "text": {"type": "plain_text", "text": "Open"}, "url": gmail_link}
+                                }
+                            ]
+                        )
+
+        except Exception as e:
+            print(f"Error generating AI family summary: {e}")
 
     def run_now(self, job_id: str):
         """Manually trigger a scheduled job."""

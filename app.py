@@ -126,6 +126,8 @@ def slack_commands():
         return handle_stats_command(user_id, channel_id)
     elif command == '/invites':
         return handle_invites_command(text, user_id, channel_id)
+    elif command == '/family':
+        return handle_family_command(text, user_id, channel_id)
 
     return jsonify({
         'response_type': 'ephemeral',
@@ -1142,6 +1144,307 @@ def handle_invites_command(text, user_id, channel_id):
         'response_type': 'ephemeral',
         'text': "Processing calendar invites..."
     })
+
+
+def handle_family_command(text, user_id, channel_id):
+    """Handle /family slash command - summarize family/school announcements."""
+    import threading
+
+    # Parse optional days parameter (default 7 days)
+    days = 7
+    if text:
+        try:
+            days = int(text)
+        except ValueError:
+            pass
+
+    def process_family_async():
+        """Process family emails in background thread."""
+        try:
+            r = get_router()
+            client = get_slack_client()
+
+            if client:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"👨‍👩‍👧‍👦 Scanning family announcements from the last {days} days..."
+                )
+
+            # Build query for family senders
+            family_senders = Config.FAMILY_SENDERS
+            if not family_senders:
+                if client:
+                    client.chat_postMessage(
+                        channel=channel_id,
+                        text="No family senders configured. Add them in config.py or FAMILY_SENDERS env var."
+                    )
+                return
+
+            # Create OR query for all family senders
+            sender_queries = ' OR '.join([f'from:{sender}' for sender in family_senders])
+            hours_back = days * 24
+
+            from datetime import datetime, timedelta
+            after_date = datetime.now() - timedelta(hours=hours_back)
+            after_timestamp = int(after_date.timestamp())
+
+            query = f'({sender_queries}) after:{after_timestamp}'
+
+            # Fetch emails
+            results = r.gmail_service.users().messages().list(
+                userId='me',
+                q=query,
+                maxResults=50
+            ).execute()
+
+            messages = results.get('messages', [])
+
+            if not messages:
+                if client:
+                    client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"No family announcements found in the last {days} days."
+                    )
+                return
+
+            # Get full details for each email
+            emails_data = []
+            for msg in messages:
+                msg_detail = r.gmail_service.users().messages().get(
+                    userId='me',
+                    id=msg['id'],
+                    format='full'
+                ).execute()
+
+                headers = msg_detail.get('payload', {}).get('headers', [])
+                subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '')
+                sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
+                date_str = next((h['value'] for h in headers if h['name'] == 'Date'), '')
+
+                # Get body
+                body = r.get_email_body(msg_detail)[:2000]  # Limit body size
+
+                emails_data.append({
+                    'message_id': msg['id'],
+                    'subject': subject,
+                    'sender': sender,
+                    'date': date_str,
+                    'body': body,
+                    'snippet': msg_detail.get('snippet', '')
+                })
+
+            # Send header
+            if client:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text="Family Announcements Summary",
+                    blocks=[
+                        {
+                            "type": "header",
+                            "text": {"type": "plain_text", "text": "👨‍👩‍👧‍👦 Family Announcements Summary"}
+                        },
+                        {
+                            "type": "context",
+                            "elements": [{"type": "mrkdwn", "text": f"_{len(emails_data)} emails from the last {days} days_"}]
+                        }
+                    ]
+                )
+
+            # Use AI to generate structured summary with email references
+            if Config.is_ai_enabled():
+                sections = _generate_family_summary_sections(emails_data)
+                _send_family_sections_to_slack(client, channel_id, sections, emails_data)
+            else:
+                # Basic fallback without AI
+                summary = _generate_basic_family_summary(emails_data)
+                if client:
+                    client.chat_postMessage(
+                        channel=channel_id,
+                        text=summary
+                    )
+
+        except Exception as e:
+            client = get_slack_client()
+            if client:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"Error fetching family announcements: {str(e)}"
+                )
+
+    # Start background thread
+    thread = threading.Thread(target=process_family_async)
+    thread.start()
+
+    return jsonify({
+        'response_type': 'ephemeral',
+        'text': "Fetching family announcements..."
+    })
+
+
+def _generate_family_summary_sections(emails_data):
+    """Use AI to generate structured summary sections with email references."""
+    import json
+    from anthropic import Anthropic
+
+    client = Anthropic(api_key=Config.ANTHROPIC_API_KEY)
+
+    # Prepare email content for AI with index references
+    email_texts = []
+    for i, email in enumerate(emails_data):
+        email_texts.append(f"""
+[EMAIL_{i}]
+From: {email['sender']}
+Subject: {email['subject']}
+Content: {email['body'][:1500]}
+---""")
+
+    prompt = f"""Analyze these family/school emails and categorize the important information.
+
+Return a JSON object with these sections. Each item should reference which email it came from using the EMAIL_X index.
+
+{{
+  "action_required": [
+    {{"text": "Fill out T-shirt order form by Friday", "email_index": 0}},
+    {{"text": "Payment due for field trip", "email_index": 2}}
+  ],
+  "upcoming_dates": [
+    {{"text": "Feb 14 - Valentine's Day party", "email_index": 1}},
+    {{"text": "Feb 17 - No school (Presidents Day)", "email_index": 3}}
+  ],
+  "important_changes": [
+    {{"text": "No hot lunch on Wednesday - pack lunch", "email_index": 4}}
+  ],
+  "announcements": [
+    {{"text": "New after-school program starting next month", "email_index": 5}}
+  ]
+}}
+
+Rules:
+- Only include items that are actually mentioned in the emails
+- Be concise but specific (include dates, deadlines, amounts when mentioned)
+- If a section has no items, use an empty array []
+- email_index must match the EMAIL_X number from the source email
+- Focus on what a parent needs to know or do
+
+Emails to analyze:
+{''.join(email_texts)}
+
+Return ONLY the JSON object, no other text."""
+
+    response = client.messages.create(
+        model=Config.AI_MODEL,
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    # Parse JSON response
+    try:
+        response_text = response.content[0].text.strip()
+        # Handle potential markdown code blocks
+        if response_text.startswith('```'):
+            response_text = response_text.split('```')[1]
+            if response_text.startswith('json'):
+                response_text = response_text[4:]
+        sections = json.loads(response_text)
+    except json.JSONDecodeError:
+        # Fallback structure if parsing fails
+        sections = {
+            "action_required": [],
+            "upcoming_dates": [],
+            "important_changes": [],
+            "announcements": [{"text": "Could not parse summary. Please check individual emails.", "email_index": 0}]
+        }
+
+    return sections
+
+
+def _send_family_sections_to_slack(client, channel_id, sections, emails_data):
+    """Send each section as a separate Slack message with related emails."""
+
+    section_config = [
+        ("action_required", "🚨 Action Required", "Things that need your attention"),
+        ("upcoming_dates", "📅 Upcoming Dates", "Events and deadlines to remember"),
+        ("important_changes", "⚠️ Important Changes", "Schedule or routine changes"),
+        ("announcements", "📢 Announcements", "Good to know"),
+    ]
+
+    for section_key, section_title, section_desc in section_config:
+        items = sections.get(section_key, [])
+
+        if not items:
+            continue  # Skip empty sections
+
+        # Build bullet points
+        bullet_text = ""
+        email_indices = []
+        for item in items:
+            bullet_text += f"• {item.get('text', '')}\n"
+            idx = item.get('email_index')
+            if idx is not None and idx not in email_indices:
+                email_indices.append(idx)
+
+        # Send section header with bullet points
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": section_title}
+            },
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f"_{section_desc}_"}]
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": bullet_text}
+            },
+            {"type": "divider"}
+        ]
+
+        client.chat_postMessage(
+            channel=channel_id,
+            text=section_title,
+            blocks=blocks
+        )
+
+        # Send related emails in order
+        for idx in email_indices:
+            if idx < len(emails_data):
+                email = emails_data[idx]
+                gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{email['message_id']}"
+                sender_name = email['sender'].split('<')[0].strip().strip('"') if '<' in email['sender'] else email['sender']
+
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=email['subject'],
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"*{email['subject'][:60]}*\n_{sender_name}_"
+                            },
+                            "accessory": {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "Open"},
+                                "url": gmail_link,
+                                "action_id": "open_family_email"
+                            }
+                        }
+                    ]
+                )
+
+
+def _generate_basic_family_summary(emails_data):
+    """Generate a basic summary without AI."""
+    lines = ["*Recent announcements:*\n"]
+
+    for email in emails_data[:10]:
+        sender_name = email['sender'].split('<')[0].strip().strip('"') if '<' in email['sender'] else email['sender']
+        lines.append(f"• *{email['subject'][:50]}* - _{sender_name}_")
+
+    lines.append("\n_Enable AI (ANTHROPIC_API_KEY) for smart summaries with action items._")
+
+    return '\n'.join(lines)
 
 
 def handle_dm_command(event):
