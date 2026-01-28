@@ -103,6 +103,70 @@ class Config:
         'dmsnews-nvnet.org',
     ]
 
+    # ===========================================
+    # WORK EMAIL CONFIGURATION
+    # ===========================================
+
+    # Internal company domain
+    WORK_INTERNAL_DOMAINS = [
+        s.strip() for s in os.getenv('WORK_INTERNAL_DOMAINS', '').split(',') if s.strip()
+    ] or [
+        'hyro.ai',
+    ]
+
+    # Investor domains (VCs, investors)
+    WORK_INVESTORS = [
+        s.strip() for s in os.getenv('WORK_INVESTORS', '').split(',') if s.strip()
+    ] or [
+        'healthiercapital.com',
+        'definevc.com',
+        'nvp.com',
+        'macquarie.com',
+        'spero.vc',
+    ]
+
+    # Customer domains (US health systems)
+    WORK_CUSTOMERS = [
+        s.strip() for s in os.getenv('WORK_CUSTOMERS', '').split(',') if s.strip()
+    ] or [
+        # Known customers
+        'christushealth.org',
+        'sutterhealth.org',
+        'ehmchealth.org',
+        'htahealth.com',
+        # Add more health systems as needed
+    ]
+
+    # Health system domain patterns (for pattern matching)
+    HEALTH_SYSTEM_PATTERNS = [
+        'health.org', 'health.com', 'hospital.org', 'hospital.com',
+        'medical.org', 'medical.com', 'healthcare.org', 'healthcare.com',
+        'med.org', 'clinic.org', 'health.edu', 'mayo.edu',
+    ]
+
+    # Contract/signature platforms (always important)
+    WORK_CONTRACT_PLATFORMS = [
+        'docusign.net',
+        'adobesign.com',
+        'rightsignature.com',
+        'hellosign.com',
+        'pandadoc.com',
+    ]
+
+    # Marketing/newsletter domains to skip
+    WORK_SKIP_DOMAINS = [
+        s.strip() for s in os.getenv('WORK_SKIP_DOMAINS', '').split(',') if s.strip()
+    ] or [
+        'beehiiv.com', 'substack.com', 'mailchimp.com',
+        'stitchfix.com', 'bloomingdales.com', 'canyonranch.com',
+        'zillow.com', 'americandream.com',
+    ]
+
+    # Work summary scheduling
+    WORK_SUMMARY_HOUR = int(os.getenv('WORK_SUMMARY_HOUR', '7'))  # 7 AM
+    WORK_SUMMARY_MINUTE = int(os.getenv('WORK_SUMMARY_MINUTE', '30'))
+    WORK_SUMMARY_DAYS = int(os.getenv('WORK_SUMMARY_DAYS', '1'))  # Look back 1 day
+
     @classmethod
     def get_gmail_config(cls) -> dict:
         """Get Gmail-related configuration as a dictionary."""

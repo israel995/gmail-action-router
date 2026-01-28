@@ -106,6 +106,19 @@ class EmailScheduler:
             replace_existing=True
         )
 
+        # Work email summary - weekdays at 7:30 AM
+        self.scheduler.add_job(
+            self.send_work_summary,
+            CronTrigger(
+                hour=Config.WORK_SUMMARY_HOUR,
+                minute=Config.WORK_SUMMARY_MINUTE,
+                day_of_week='mon-fri'
+            ),
+            id='work_summary',
+            name='Work Email Summary',
+            replace_existing=True
+        )
+
         print(f"Scheduled jobs:")
         for job in self.scheduler.get_jobs():
             print(f"  - {job.name}: {job.trigger}")
@@ -679,6 +692,286 @@ Return ONLY the JSON object."""
 
         except Exception as e:
             print(f"Error generating AI family summary: {e}")
+
+    def send_work_summary(self):
+        """Send daily work email summary with smart categorization."""
+        if not self.slack_client or not self.router:
+            return
+
+        try:
+            import re
+            print(f"[{datetime.now()}] Generating work email summary...")
+
+            days = getattr(Config, 'WORK_SUMMARY_DAYS', 1)
+            hours_back = days * 24
+
+            after_date = datetime.now() - timedelta(hours=hours_back)
+            after_timestamp = int(after_date.timestamp())
+
+            # Build query excluding marketing domains
+            skip_domains = getattr(Config, 'WORK_SKIP_DOMAINS', [])
+            skip_query = ' '.join([f'-from:{d}' for d in skip_domains[:10]])
+
+            query = f'in:inbox after:{after_timestamp} {skip_query}'
+
+            results = self.router.gmail_service.users().messages().list(
+                userId='me',
+                q=query,
+                maxResults=100
+            ).execute()
+
+            messages = results.get('messages', [])
+
+            if not messages:
+                self.slack_client.chat_postMessage(
+                    channel=Config.SLACK_CHANNEL,
+                    text=f"💼 Good morning! No new work emails in the last {days} day(s)."
+                )
+                return
+
+            # Get email details with domain classification
+            emails_data = []
+            for msg in messages:
+                msg_detail = self.router.gmail_service.users().messages().get(
+                    userId='me',
+                    id=msg['id'],
+                    format='full'
+                ).execute()
+
+                headers = msg_detail.get('payload', {}).get('headers', [])
+                subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '')
+                sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
+
+                email_match = re.search(r'<([^>]+)>', sender)
+                sender_email = email_match.group(1) if email_match else sender
+                sender_domain = sender_email.split('@')[-1] if '@' in sender_email else ''
+
+                domain_category = self._classify_work_domain(sender_domain)
+
+                emails_data.append({
+                    'message_id': msg['id'],
+                    'subject': subject,
+                    'sender': sender,
+                    'sender_email': sender_email,
+                    'sender_domain': sender_domain,
+                    'snippet': msg_detail.get('snippet', ''),
+                    'domain_category': domain_category
+                })
+
+            # Send header
+            self.slack_client.chat_postMessage(
+                channel=Config.SLACK_CHANNEL,
+                text="Work Email Summary",
+                blocks=[
+                    {
+                        "type": "header",
+                        "text": {"type": "plain_text", "text": "💼 Good Morning! Work Email Summary"}
+                    },
+                    {
+                        "type": "context",
+                        "elements": [{"type": "mrkdwn", "text": f"_{len(emails_data)} emails from the last {days} day(s)_"}]
+                    }
+                ]
+            )
+
+            # Generate AI summary if available
+            if Config.is_ai_enabled():
+                self._send_work_sections(emails_data)
+            else:
+                self._send_basic_work_summary(emails_data)
+
+            print(f"[{datetime.now()}] Work summary sent: {len(emails_data)} emails")
+
+        except Exception as e:
+            print(f"Error sending work summary: {e}")
+
+    def _classify_work_domain(self, sender_domain):
+        """Classify email sender by domain."""
+        sender_domain = sender_domain.lower()
+
+        internal_domains = getattr(Config, 'WORK_INTERNAL_DOMAINS', ['hyro.ai'])
+        if any(d in sender_domain for d in internal_domains):
+            return 'internal'
+
+        investors = getattr(Config, 'WORK_INVESTORS', [])
+        if any(d in sender_domain for d in investors):
+            return 'investor'
+
+        customers = getattr(Config, 'WORK_CUSTOMERS', [])
+        if any(d in sender_domain for d in customers):
+            return 'customer'
+
+        health_patterns = getattr(Config, 'HEALTH_SYSTEM_PATTERNS', [])
+        if any(p in sender_domain for p in health_patterns):
+            return 'customer'
+
+        contracts = getattr(Config, 'WORK_CONTRACT_PLATFORMS', [])
+        if any(d in sender_domain for d in contracts):
+            return 'contract'
+
+        return 'other'
+
+    def _send_work_sections(self, emails_data):
+        """Generate AI work summary and send sections to Slack."""
+        import json
+        from anthropic import Anthropic
+
+        try:
+            client = Anthropic(api_key=Config.ANTHROPIC_API_KEY)
+
+            # Prepare email content with domain hints
+            email_texts = []
+            for i, email in enumerate(emails_data[:50]):
+                domain_hint = f"[{email['domain_category'].upper()}]" if email['domain_category'] != 'other' else ""
+                email_texts.append(f"""
+[EMAIL_{i}] {domain_hint}
+From: {email['sender'][:60]}
+Subject: {email['subject']}
+Preview: {email['snippet'][:300]}
+---""")
+
+            prompt = f"""Analyze these work emails for a CEO/executive and categorize by response urgency.
+
+Context:
+- INTERNAL = company colleagues
+- INVESTOR = VCs/investors
+- CUSTOMER = health systems/customers
+- CONTRACT = needs signature
+
+Return JSON with 4 sections:
+{{
+  "urgent_reply": [{{"text": "description", "email_index": 0, "reason": "why urgent"}}],
+  "reply_needed": [{{"text": "description", "email_index": 1, "reason": "why"}}],
+  "review_decide": [{{"text": "description", "email_index": 2, "reason": "what decision"}}],
+  "fyi": [{{"text": "description", "email_index": 3}}]
+}}
+
+Rules:
+- URGENT: Active deals, NDA negotiations, customer issues, investor questions
+- REPLY_NEEDED: Meeting coordination, partnership discussions, proposals
+- REVIEW_DECIDE: Opportunities, approvals, strategic decisions
+- FYI: Industry updates, announcements, informational
+- Skip marketing, cold outreach, newsletters
+
+Emails:
+{''.join(email_texts)}
+
+Return ONLY JSON."""
+
+            response = client.messages.create(
+                model=Config.AI_MODEL,
+                max_tokens=3000,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            response_text = response.content[0].text.strip()
+            if response_text.startswith('```'):
+                response_text = response_text.split('```')[1]
+                if response_text.startswith('json'):
+                    response_text = response_text[4:]
+            sections = json.loads(response_text)
+
+            section_config = [
+                ("urgent_reply", "🔴 Urgent - Reply Today", "Time-sensitive, needs immediate response"),
+                ("reply_needed", "🟠 Reply Needed", "Important but can wait 24-48 hours"),
+                ("review_decide", "🟡 Review & Decide", "Requires your input or decision"),
+                ("fyi", "🔵 FYI - Keep Informed", "No action needed"),
+            ]
+
+            for section_key, section_title, section_desc in section_config:
+                items = sections.get(section_key, [])
+                if not items:
+                    continue
+
+                bullet_text = ""
+                email_indices = []
+                for item in items:
+                    text = item.get('text', '')
+                    reason = item.get('reason', '')
+                    if reason:
+                        bullet_text += f"• {text}\n  _↳ {reason}_\n"
+                    else:
+                        bullet_text += f"• {text}\n"
+                    idx = item.get('email_index')
+                    if idx is not None and idx not in email_indices:
+                        email_indices.append(idx)
+
+                self.slack_client.chat_postMessage(
+                    channel=Config.SLACK_CHANNEL,
+                    text=section_title,
+                    blocks=[
+                        {"type": "header", "text": {"type": "plain_text", "text": section_title}},
+                        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"_{section_desc}_"}]},
+                        {"type": "section", "text": {"type": "mrkdwn", "text": bullet_text}},
+                        {"type": "divider"}
+                    ]
+                )
+
+                for idx in email_indices:
+                    if idx < len(emails_data):
+                        email = emails_data[idx]
+                        gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{email['message_id']}"
+                        sender_name = email['sender'].split('<')[0].strip().strip('"') if '<' in email['sender'] else email['sender']
+
+                        category_badge = {'internal': '🏢', 'investor': '💰', 'customer': '🏥', 'contract': '📝'}.get(email['domain_category'], '')
+
+                        self.slack_client.chat_postMessage(
+                            channel=Config.SLACK_CHANNEL,
+                            text=email['subject'],
+                            blocks=[
+                                {
+                                    "type": "section",
+                                    "text": {"type": "mrkdwn", "text": f"{category_badge}*{email['subject'][:60]}*\n_{sender_name}_"},
+                                    "accessory": {"type": "button", "text": {"type": "plain_text", "text": "Open"}, "url": gmail_link, "action_id": "open_work_email"}
+                                },
+                                {
+                                    "type": "actions",
+                                    "elements": [
+                                        {"type": "button", "text": {"type": "plain_text", "text": "Archive"}, "action_id": "archive_email", "value": email['message_id']},
+                                        {"type": "button", "text": {"type": "plain_text", "text": "Reply"}, "action_id": "reply_email", "value": email['message_id']},
+                                        {"type": "button", "text": {"type": "plain_text", "text": "Snooze"}, "action_id": "snooze_email", "value": email['message_id']}
+                                    ]
+                                }
+                            ]
+                        )
+
+        except Exception as e:
+            print(f"Error generating AI work summary: {e}")
+
+    def _send_basic_work_summary(self, emails_data):
+        """Send basic work summary without AI."""
+        by_category = {}
+        for email in emails_data:
+            cat = email['domain_category']
+            if cat not in by_category:
+                by_category[cat] = []
+            by_category[cat].append(email)
+
+        category_names = {
+            'internal': '🏢 Internal',
+            'investor': '💰 Investors',
+            'customer': '🏥 Customers',
+            'contract': '📝 Contracts',
+            'other': '📧 Other'
+        }
+
+        for cat in ['contract', 'internal', 'investor', 'customer', 'other']:
+            if cat not in by_category:
+                continue
+
+            emails = by_category[cat][:10]
+            if not emails:
+                continue
+
+            lines = [f"*{category_names.get(cat, cat)}*\n"]
+            for email in emails:
+                sender_name = email['sender'].split('<')[0].strip().strip('"')[:20]
+                lines.append(f"• {email['subject'][:40]} - _{sender_name}_")
+
+            self.slack_client.chat_postMessage(
+                channel=Config.SLACK_CHANNEL,
+                text='\n'.join(lines)
+            )
 
     def run_now(self, job_id: str):
         """Manually trigger a scheduled job."""
