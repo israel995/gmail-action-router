@@ -194,10 +194,10 @@ class Config:
     COPILOT_BRIEFING_MINUTE = int(os.getenv('COPILOT_BRIEFING_MINUTE', '0'))
 
     # How often to check for overdue VIPs and stalled projects (minutes)
-    COPILOT_CHECK_INTERVAL_MINUTES = int(os.getenv('COPILOT_CHECK_INTERVAL_MINUTES', '120'))
+    COPILOT_CHECK_INTERVAL_MINUTES = int(os.getenv('COPILOT_CHECK_INTERVAL_MINUTES', '480'))
 
     # Notion sync interval (minutes)
-    NOTION_SYNC_INTERVAL_MINUTES = int(os.getenv('NOTION_SYNC_INTERVAL_MINUTES', '30'))
+    NOTION_SYNC_INTERVAL_MINUTES = int(os.getenv('NOTION_SYNC_INTERVAL_MINUTES', '480'))
 
     @classmethod
     def parse_vip_contacts(cls) -> list:
