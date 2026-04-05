@@ -119,6 +119,38 @@ class EmailScheduler:
             replace_existing=True
         )
 
+        # CEO Co-pilot morning briefing - weekdays at configured time (default 8 AM)
+        self.scheduler.add_job(
+            self.send_copilot_briefing,
+            CronTrigger(
+                hour=Config.COPILOT_BRIEFING_HOUR,
+                minute=Config.COPILOT_BRIEFING_MINUTE,
+                day_of_week='mon-fri'
+            ),
+            id='copilot_briefing',
+            name='CEO Co-pilot Morning Briefing',
+            replace_existing=True
+        )
+
+        # CEO Co-pilot alert check - every N minutes (default 2h)
+        self.scheduler.add_job(
+            self.check_copilot_alerts,
+            IntervalTrigger(minutes=Config.COPILOT_CHECK_INTERVAL_MINUTES),
+            id='copilot_alerts',
+            name='CEO Co-pilot Alert Check',
+            replace_existing=True
+        )
+
+        # Notion sync - every N minutes (default 30m)
+        if Config.is_notion_enabled():
+            self.scheduler.add_job(
+                self.sync_notion,
+                IntervalTrigger(minutes=Config.NOTION_SYNC_INTERVAL_MINUTES),
+                id='notion_sync',
+                name='Notion Action Items Sync',
+                replace_existing=True
+            )
+
         print(f"Scheduled jobs:")
         for job in self.scheduler.get_jobs():
             print(f"  - {job.name}: {job.trigger}")
@@ -972,6 +1004,50 @@ Return ONLY JSON."""
                 channel=Config.SLACK_CHANNEL,
                 text='\n'.join(lines)
             )
+
+    def send_copilot_briefing(self):
+        """Send the morning CEO co-pilot briefing to Slack."""
+        if not self.slack_client:
+            return
+        try:
+            from ceo_copilot import copilot
+            print(f"[{datetime.now()}] Sending CEO co-pilot morning briefing...")
+            blocks = copilot.build_dashboard_blocks()
+            self.slack_client.chat_postMessage(
+                channel=Config.COPILOT_CHANNEL,
+                text=":robot_face: CEO Co-pilot Morning Briefing",
+                blocks=blocks,
+            )
+            print(f"[{datetime.now()}] Co-pilot briefing sent.")
+        except Exception as e:
+            print(f"[{datetime.now()}] Error sending co-pilot briefing: {e}")
+
+    def check_copilot_alerts(self):
+        """Check for overdue VIPs/projects and push alerts if needed."""
+        if not self.slack_client:
+            return
+        try:
+            from ceo_copilot import copilot
+            blocks = copilot.get_alert_blocks()
+            if blocks:
+                print(f"[{datetime.now()}] Sending CEO co-pilot alert...")
+                self.slack_client.chat_postMessage(
+                    channel=Config.COPILOT_CHANNEL,
+                    text=":rotating_light: CEO Co-pilot Alert",
+                    blocks=blocks,
+                )
+        except Exception as e:
+            print(f"[{datetime.now()}] Error checking co-pilot alerts: {e}")
+
+    def sync_notion(self):
+        """Sync action items from Notion into the local database."""
+        try:
+            from ceo_copilot import copilot
+            count = copilot.sync_notion_action_items()
+            if count:
+                print(f"[{datetime.now()}] Synced {count} new action items from Notion.")
+        except Exception as e:
+            print(f"[{datetime.now()}] Notion sync error: {e}")
 
     def run_now(self, job_id: str):
         """Manually trigger a scheduled job."""

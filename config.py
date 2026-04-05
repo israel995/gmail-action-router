@@ -167,6 +167,75 @@ class Config:
     WORK_SUMMARY_MINUTE = int(os.getenv('WORK_SUMMARY_MINUTE', '30'))
     WORK_SUMMARY_DAYS = int(os.getenv('WORK_SUMMARY_DAYS', '1'))  # Look back 1 day
 
+    # ===========================================
+    # CEO CO-PILOT CONFIGURATION
+    # ===========================================
+
+    # Notion integration
+    NOTION_API_KEY = os.getenv('NOTION_API_KEY')
+    NOTION_ACTION_ITEMS_DB = os.getenv('NOTION_ACTION_ITEMS_DB')  # Database ID for action items
+    NOTION_PROJECTS_DB = os.getenv('NOTION_PROJECTS_DB')          # Database ID for projects
+
+    # VIP contacts: "Name:email:role,Name2:email2:role2"
+    # e.g. "Alice Smith:alice@company.com:CTO,Bob Lee:bob@company.com:VP Sales"
+    VIP_CONTACTS_RAW = os.getenv('VIP_CONTACTS', '')
+
+    # Default silence threshold (hours) before alerting about a VIP contact
+    VIP_DEFAULT_SILENCE_HOURS = int(os.getenv('VIP_DEFAULT_SILENCE_HOURS', '48'))
+
+    # Tracked projects: "ProjectName:keyword1+keyword2,Project2:kw1+kw2"
+    TRACKED_PROJECTS_RAW = os.getenv('TRACKED_PROJECTS', '')
+
+    # Co-pilot Slack channel (defaults to main channel)
+    COPILOT_CHANNEL = os.getenv('COPILOT_CHANNEL', os.getenv('SLACK_CHANNEL', '#email-actions'))
+
+    # Co-pilot morning briefing schedule (default: 8 AM weekdays)
+    COPILOT_BRIEFING_HOUR = int(os.getenv('COPILOT_BRIEFING_HOUR', '8'))
+    COPILOT_BRIEFING_MINUTE = int(os.getenv('COPILOT_BRIEFING_MINUTE', '0'))
+
+    # How often to check for overdue VIPs and stalled projects (minutes)
+    COPILOT_CHECK_INTERVAL_MINUTES = int(os.getenv('COPILOT_CHECK_INTERVAL_MINUTES', '120'))
+
+    # Notion sync interval (minutes)
+    NOTION_SYNC_INTERVAL_MINUTES = int(os.getenv('NOTION_SYNC_INTERVAL_MINUTES', '30'))
+
+    @classmethod
+    def parse_vip_contacts(cls) -> list:
+        """Parse VIP_CONTACTS env var into a list of dicts."""
+        contacts = []
+        if not cls.VIP_CONTACTS_RAW:
+            return contacts
+        for entry in cls.VIP_CONTACTS_RAW.split(','):
+            parts = [p.strip() for p in entry.split(':')]
+            if len(parts) >= 2:
+                contacts.append({
+                    'name': parts[0],
+                    'email': parts[1],
+                    'role': parts[2] if len(parts) > 2 else '',
+                    'max_silence_hours': int(parts[3]) if len(parts) > 3 else cls.VIP_DEFAULT_SILENCE_HOURS,
+                })
+        return contacts
+
+    @classmethod
+    def parse_tracked_projects(cls) -> list:
+        """Parse TRACKED_PROJECTS env var into a list of dicts."""
+        projects = []
+        if not cls.TRACKED_PROJECTS_RAW:
+            return projects
+        for entry in cls.TRACKED_PROJECTS_RAW.split(','):
+            parts = [p.strip() for p in entry.split(':')]
+            if parts[0]:
+                projects.append({
+                    'name': parts[0],
+                    'keywords': parts[1].replace('+', ',') if len(parts) > 1 else parts[0],
+                })
+        return projects
+
+    @classmethod
+    def is_notion_enabled(cls) -> bool:
+        """Check if Notion integration is configured."""
+        return bool(cls.NOTION_API_KEY)
+
     @classmethod
     def get_gmail_config(cls) -> dict:
         """Get Gmail-related configuration as a dictionary."""

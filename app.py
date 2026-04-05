@@ -130,6 +130,23 @@ def slack_commands():
         return handle_family_command(text, user_id, channel_id)
     elif command == '/work':
         return handle_work_command(text, user_id, channel_id)
+    # CEO Co-pilot commands
+    elif command == '/copilot':
+        return handle_copilot_command(text, user_id, channel_id)
+    elif command == '/team':
+        return handle_team_command(text, user_id, channel_id)
+    elif command == '/projects':
+        return handle_projects_command(text, user_id, channel_id)
+    elif command == '/followup':
+        return handle_followup_command(text, user_id, channel_id)
+    elif command == '/add-vip':
+        return handle_add_vip_command(text, user_id, channel_id)
+    elif command == '/remove-vip':
+        return handle_remove_vip_command(text, user_id, channel_id)
+    elif command == '/add-project':
+        return handle_add_project_command(text, user_id, channel_id)
+    elif command == '/log-action':
+        return handle_log_action_command(text, user_id, channel_id)
 
     return jsonify({
         'response_type': 'ephemeral',
@@ -184,6 +201,15 @@ def handle_block_actions(payload):
             return handle_accept_invite(message_id, user, channel, message)
         elif action_id == 'decline_invite':
             return handle_decline_invite(message_id, user, channel, message)
+        # CEO Co-pilot button actions
+        elif action_id in ('copilot_team', 'view_team'):
+            return handle_team_command('', user.get('id'), channel.get('id'))
+        elif action_id in ('copilot_projects', 'view_projects'):
+            return handle_projects_command('', user.get('id'), channel.get('id'))
+        elif action_id in ('copilot_actions', 'view_actions'):
+            return handle_copilot_actions_inline(channel.get('id'))
+        elif action_id in ('copilot_briefing', 'copilot_full_briefing', 'view_briefing'):
+            return handle_copilot_command('', user.get('id'), channel.get('id'))
 
     return jsonify({'ok': True})
 
@@ -1858,6 +1884,306 @@ def _send_basic_work_summary(client, channel_id, emails_data):
     )
 
 
+# ─── CEO Co-pilot Command Handlers ───────────────────────────────────────────────
+
+def handle_copilot_command(text: str, user_id: str, channel_id: str):
+    """
+    /copilot — Full CEO co-pilot morning briefing.
+    Shows overdue VIP contacts, stalled projects, and action items.
+    """
+    from ceo_copilot import copilot
+
+    client = get_slack_client()
+    if not client:
+        return jsonify({'response_type': 'ephemeral', 'text': 'Slack client not configured.'})
+
+    # Respond immediately, then send blocks
+    try:
+        blocks = copilot.build_dashboard_blocks()
+        client.chat_postMessage(
+            channel=channel_id,
+            text=":robot_face: CEO Co-pilot Briefing",
+            blocks=blocks,
+        )
+    except Exception as e:
+        client.chat_postMessage(channel=channel_id, text=f":x: Co-pilot error: {e}")
+
+    return jsonify({'response_type': 'in_channel', 'text': ''})
+
+
+def handle_team_command(text: str, user_id: str, channel_id: str):
+    """
+    /team — Show management team communication status.
+    """
+    from ceo_copilot import copilot
+
+    client = get_slack_client()
+    if not client:
+        return jsonify({'response_type': 'ephemeral', 'text': 'Slack client not configured.'})
+
+    try:
+        blocks = copilot.build_team_blocks()
+        client.chat_postMessage(
+            channel=channel_id,
+            text=":busts_in_silhouette: Management Team Status",
+            blocks=blocks,
+        )
+    except Exception as e:
+        client.chat_postMessage(channel=channel_id, text=f":x: Error: {e}")
+
+    return jsonify({'response_type': 'in_channel', 'text': ''})
+
+
+def handle_projects_command(text: str, user_id: str, channel_id: str):
+    """
+    /projects — Show tracked project status.
+    """
+    from ceo_copilot import copilot
+
+    client = get_slack_client()
+    if not client:
+        return jsonify({'response_type': 'ephemeral', 'text': 'Slack client not configured.'})
+
+    try:
+        blocks = copilot.build_projects_blocks()
+        client.chat_postMessage(
+            channel=channel_id,
+            text=":file_folder: Project Tracker",
+            blocks=blocks,
+        )
+    except Exception as e:
+        client.chat_postMessage(channel=channel_id, text=f":x: Error: {e}")
+
+    return jsonify({'response_type': 'in_channel', 'text': ''})
+
+
+def handle_followup_command(text: str, user_id: str, channel_id: str):
+    """
+    /followup <name or project> — Show detailed follow-up view.
+    """
+    from ceo_copilot import copilot
+
+    client = get_slack_client()
+    if not client:
+        return jsonify({'response_type': 'ephemeral', 'text': 'Slack client not configured.'})
+
+    query = text.strip()
+    if not query:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': 'Usage: `/followup <person name or project name>`'
+        })
+
+    try:
+        blocks = copilot.build_followup_blocks(query)
+        client.chat_postMessage(
+            channel=channel_id,
+            text=f":mag: Follow-up: {query}",
+            blocks=blocks,
+        )
+    except Exception as e:
+        client.chat_postMessage(channel=channel_id, text=f":x: Error: {e}")
+
+    return jsonify({'response_type': 'in_channel', 'text': ''})
+
+
+def handle_add_vip_command(text: str, user_id: str, channel_id: str):
+    """
+    /add-vip <Name> <email> [Role] [silence_hours]
+    Add a VIP contact to track. Name can be multi-word before the email.
+    """
+    client = get_slack_client()
+    if not client:
+        return jsonify({'response_type': 'ephemeral', 'text': 'Slack client not configured.'})
+
+    parts = text.strip().split()
+    if len(parts) < 2:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': 'Usage: `/add-vip <Name> <email@domain.com> [Role] [silence_hours]`\nExample: `/add-vip Alice Smith alice@company.com CTO 48`'
+        })
+
+    # Find the email (contains @)
+    email_idx = next((i for i, p in enumerate(parts) if '@' in p), None)
+    if email_idx is None:
+        return jsonify({'response_type': 'ephemeral', 'text': ':x: Could not find an email address in the input.'})
+
+    name = ' '.join(parts[:email_idx])
+    email = parts[email_idx]
+    role = parts[email_idx + 1] if len(parts) > email_idx + 1 else ''
+    try:
+        silence_hours = int(parts[email_idx + 2]) if len(parts) > email_idx + 2 else Config.VIP_DEFAULT_SILENCE_HOURS
+    except ValueError:
+        silence_hours = Config.VIP_DEFAULT_SILENCE_HOURS
+
+    from database import db
+    contact_id = db.add_vip_contact(name=name, email=email, role=role, max_silence_hours=silence_hours)
+
+    client.chat_postMessage(
+        channel=channel_id,
+        text=f":white_check_mark: Added VIP contact: *{name}* (`{email}`) as _{role or 'Team Member'}_ — alert after {silence_hours}h silence"
+    )
+    return jsonify({'response_type': 'in_channel', 'text': ''})
+
+
+def handle_remove_vip_command(text: str, user_id: str, channel_id: str):
+    """
+    /remove-vip <Name or email> — Stop tracking a VIP contact.
+    """
+    client = get_slack_client()
+    if not client:
+        return jsonify({'response_type': 'ephemeral', 'text': 'Slack client not configured.'})
+
+    query = text.strip()
+    if not query:
+        return jsonify({'response_type': 'ephemeral', 'text': 'Usage: `/remove-vip <name or email>`'})
+
+    from database import db
+    # Try by email first, then by name
+    contact = db.get_vip_contact_by_email(query) or db.get_vip_contact_by_name(query)
+    if not contact:
+        return jsonify({'response_type': 'ephemeral', 'text': f':x: No VIP contact found matching `{query}`'})
+
+    db.remove_vip_contact(contact['id'])
+    client.chat_postMessage(
+        channel=channel_id,
+        text=f":white_check_mark: Removed VIP contact: *{contact['name']}*"
+    )
+    return jsonify({'response_type': 'in_channel', 'text': ''})
+
+
+def handle_add_project_command(text: str, user_id: str, channel_id: str):
+    """
+    /add-project <Name> [keyword1 keyword2 ...] [notion:<page_url>]
+    Add a project to track. Keywords are space-separated words to match in emails.
+    """
+    client = get_slack_client()
+    if not client:
+        return jsonify({'response_type': 'ephemeral', 'text': 'Slack client not configured.'})
+
+    if not text.strip():
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': 'Usage: `/add-project <Name> [keyword1 keyword2] [notion:https://...]`\nExample: `/add-project Product Launch launch roadmap Q3 notion:https://notion.so/...`'
+        })
+
+    parts = text.strip().split()
+    # Extract notion URL if present
+    notion_url = None
+    filtered_parts = []
+    for p in parts:
+        if p.startswith('notion:'):
+            notion_url = p[len('notion:'):]
+        else:
+            filtered_parts.append(p)
+
+    # Heuristic: project name is first token(s) before keyword-looking parts
+    # Simple approach: first word(s) capitalised = name, rest = keywords
+    # Actually: treat all non-notion parts as the project name if only 1-2 words,
+    # otherwise first "quoted" segment. For simplicity: first part = name, rest = keywords.
+    # Support quoted name: /add-project "My Project" kw1 kw2
+    name_parts = []
+    kw_parts = []
+    in_name = True
+    joined = ' '.join(filtered_parts)
+    if joined.startswith('"'):
+        end_quote = joined.find('"', 1)
+        if end_quote > 0:
+            name_parts = [joined[1:end_quote]]
+            kw_parts = joined[end_quote + 1:].strip().split()
+        else:
+            name_parts = [filtered_parts[0]] if filtered_parts else []
+            kw_parts = filtered_parts[1:]
+    else:
+        # First word is always the project name start; subsequent lowercase words are keywords
+        for i, p in enumerate(filtered_parts):
+            if i == 0 or (in_name and p[0].isupper()):
+                name_parts.append(p)
+            else:
+                in_name = False
+                kw_parts.append(p)
+        if not kw_parts and len(name_parts) > 1:
+            kw_parts = name_parts[1:]
+            name_parts = name_parts[:1]
+
+    name = ' '.join(name_parts)
+    keywords = ','.join(kw_parts) if kw_parts else name.lower()
+
+    from database import db
+    db.add_project(name=name, keywords=keywords, notion_page_url=notion_url)
+
+    notion_note = f"  Notion: {notion_url}" if notion_url else ""
+    client.chat_postMessage(
+        channel=channel_id,
+        text=f":white_check_mark: Added project: *{name}*\nKeywords: `{keywords}`{notion_note}"
+    )
+    return jsonify({'response_type': 'in_channel', 'text': ''})
+
+
+def handle_log_action_command(text: str, user_id: str, channel_id: str):
+    """
+    /log-action <title> [project:<name>] [assign:<name>] [due:<date>] [priority:<level>]
+    Manually log an action item.
+    """
+    client = get_slack_client()
+    if not client:
+        return jsonify({'response_type': 'ephemeral', 'text': 'Slack client not configured.'})
+
+    if not text.strip():
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': 'Usage: `/log-action <title> [project:<name>] [assign:<person>] [due:<YYYY-MM-DD>] [priority:high]`'
+        })
+
+    import re as _re
+    parts = text.strip()
+    project = _re.search(r'project:([^\s]+)', parts)
+    assign = _re.search(r'assign:([^\s]+)', parts)
+    due = _re.search(r'due:(\d{4}-\d{2}-\d{2})', parts)
+    priority = _re.search(r'priority:(urgent|high|medium|low)', parts, _re.I)
+
+    # Strip out tagged parts to get the plain title
+    title = _re.sub(r'(project|assign|due|priority):[^\s]+', '', parts).strip()
+
+    from database import db
+    from datetime import datetime as _dt
+    due_dt = _dt.fromisoformat(due.group(1)) if due else None
+    item_id = db.add_action_item(
+        title=title,
+        source='manual',
+        project_name=project.group(1) if project else None,
+        assigned_to=assign.group(1) if assign else None,
+        due_date=due_dt,
+        priority=priority.group(1).lower() if priority else 'medium',
+    )
+
+    assignee_str = f"  → _{assign.group(1)}_" if assign else ""
+    proj_str = f"  [{project.group(1)}]" if project else ""
+    due_str = f"  Due: {due.group(1)}" if due else ""
+    client.chat_postMessage(
+        channel=channel_id,
+        text=f":white_check_mark: Action item logged #{item_id}: *{title}*{proj_str}{assignee_str}{due_str}"
+    )
+    return jsonify({'response_type': 'in_channel', 'text': ''})
+
+
+def handle_copilot_actions_inline(channel_id: str):
+    """Post action items list to channel."""
+    from ceo_copilot import copilot
+
+    client = get_slack_client()
+    if not client:
+        return jsonify({'ok': True})
+
+    try:
+        blocks = copilot.build_action_items_blocks()
+        client.chat_postMessage(channel=channel_id, text=":clipboard: Action Items", blocks=blocks)
+    except Exception as e:
+        client.chat_postMessage(channel=channel_id, text=f":x: Error: {e}")
+
+    return jsonify({'ok': True})
+
+
 def handle_dm_command(event):
     """Handle DM commands to the bot."""
     text = event.get('text', '').lower().strip()
@@ -1879,13 +2205,31 @@ def handle_dm_command(event):
         else:
             msg = "No active snoozes."
         client.chat_postMessage(channel=event.get('channel'), text=msg)
+    elif text in ('copilot', 'briefing'):
+        handle_copilot_command('', user, event.get('channel'))
+    elif text == 'team':
+        handle_team_command('', user, event.get('channel'))
+    elif text == 'projects':
+        handle_projects_command('', user, event.get('channel'))
     elif text == 'help':
         client.chat_postMessage(
             channel=event.get('channel'),
             text="*Available commands:*\n"
                  "• `digest` - Get email summary\n"
                  "• `snoozes` - List active snoozes\n"
-                 "• `help` - Show this message"
+                 "• `copilot` or `briefing` - CEO co-pilot dashboard\n"
+                 "• `team` - Management team status\n"
+                 "• `projects` - Project tracker\n"
+                 "• `help` - Show this message\n\n"
+                 "*Slash commands:*\n"
+                 "• `/copilot` - Full briefing\n"
+                 "• `/team` - Team communication status\n"
+                 "• `/projects` - Project tracker\n"
+                 "• `/followup <name>` - Deep-dive on a person or project\n"
+                 "• `/add-vip <Name> <email> [Role] [hours]` - Track a VIP contact\n"
+                 "• `/remove-vip <name>` - Stop tracking a VIP\n"
+                 "• `/add-project <Name> [keywords] [notion:url]` - Track a project\n"
+                 "• `/log-action <title> [project:x] [assign:x] [due:YYYY-MM-DD]` - Log action item"
         )
 
 
