@@ -74,17 +74,31 @@ class CEOCopilot:
         self._seed_from_config()
 
     def _seed_from_config(self):
-        """Seed VIP contacts and projects from env vars if not already in DB."""
-        existing_vips = {c["email"] for c in db.get_all_vip_contacts() if c.get("email")}
+        """Seed VIP contacts and projects from env vars, updating existing records."""
+        existing = {c["email"]: c for c in db.get_all_vip_contacts() if c.get("email")}
         for contact in Config.parse_vip_contacts():
-            if contact["email"] not in existing_vips:
+            email = contact["email"]
+            if email not in existing:
                 db.add_vip_contact(
                     name=contact["name"],
-                    email=contact["email"],
+                    email=email,
                     role=contact.get("role", ""),
                     max_silence_hours=contact.get("max_silence_hours", Config.VIP_DEFAULT_SILENCE_HOURS),
+                    slack_user_id=contact.get("slack_user_id"),
+                    notion_page_url=contact.get("notion_page_url"),
                 )
                 logger.info(f"Seeded VIP contact: {contact['name']}")
+            else:
+                # Update Slack/Notion fields if they were empty and now have values
+                row = existing[email]
+                updates = {}
+                if contact.get("slack_user_id") and not row.get("slack_user_id"):
+                    updates["slack_user_id"] = contact["slack_user_id"]
+                if contact.get("notion_page_url") and not row.get("notion_page_url"):
+                    updates["notion_page_url"] = contact["notion_page_url"]
+                if updates:
+                    db.update_vip_contact(row["id"], **updates)
+                    logger.info(f"Updated VIP contact: {contact['name']} {list(updates.keys())}")
 
         existing_projects = {p["name"] for p in db.get_all_projects(status=None)}
         for proj in Config.parse_tracked_projects():
@@ -346,9 +360,11 @@ class CEOCopilot:
             role_str = f" • _{vip.get('role', '')}_" if vip.get("role") else ""
             ch = vip.get("last_contact_channel") or ""
             ch_emoji = CHANNEL_EMOJI.get(ch, "")
+            slack_mention = f"  <@{vip['slack_user_id']}>" if vip.get("slack_user_id") else ""
+            notion_link = f"  <{vip['notion_page_url']}|1:1 Notes>" if vip.get("notion_page_url") else ""
 
             text = (
-                f"{emoji} *{vip['name']}*{role_str}\n"
+                f"{emoji} *{vip['name']}*{role_str}{slack_mention}{notion_link}\n"
                 f"Last contact: {_format_hours(hours)} {ch_emoji}  |  "
                 f"Last response: {_format_hours(_hours_ago(resp))}"
             )

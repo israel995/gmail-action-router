@@ -176,8 +176,9 @@ class Config:
     NOTION_ACTION_ITEMS_DB = os.getenv('NOTION_ACTION_ITEMS_DB')  # Database ID for action items
     NOTION_PROJECTS_DB = os.getenv('NOTION_PROJECTS_DB')          # Database ID for projects
 
-    # VIP contacts: "Name:email:role,Name2:email2:role2"
-    # e.g. "Alice Smith:alice@company.com:CTO,Bob Lee:bob@company.com:VP Sales"
+    # VIP contacts: "Name:email:role:silence_hours:slack_id:notion_url"
+    # Multiple contacts separated by commas
+    # e.g. "Rom Cohen:rom@hyro.ai:COO:24:U012AB3CD:https://notion.so/..."
     VIP_CONTACTS_RAW = os.getenv('VIP_CONTACTS', '')
 
     # Default silence threshold (hours) before alerting about a VIP contact
@@ -201,19 +202,36 @@ class Config:
 
     @classmethod
     def parse_vip_contacts(cls) -> list:
-        """Parse VIP_CONTACTS env var into a list of dicts."""
+        """
+        Parse VIP_CONTACTS env var into a list of dicts.
+        Format: Name:email:role:silence_hours:slack_id:notion_url
+        All fields after email are optional.
+        """
         contacts = []
         if not cls.VIP_CONTACTS_RAW:
             return contacts
-        for entry in cls.VIP_CONTACTS_RAW.split(','):
+        raw = cls.VIP_CONTACTS_RAW.strip('"').strip("'")
+        for entry in raw.split(','):
+            entry = entry.strip()
+            if not entry:
+                continue
             parts = [p.strip() for p in entry.split(':')]
-            if len(parts) >= 2:
-                contacts.append({
-                    'name': parts[0],
-                    'email': parts[1],
-                    'role': parts[2] if len(parts) > 2 else '',
-                    'max_silence_hours': int(parts[3]) if len(parts) > 3 else cls.VIP_DEFAULT_SILENCE_HOURS,
-                })
+            if len(parts) < 2:
+                continue
+            # Notion URLs contain colons (https://...), re-join anything after index 5
+            notion_url = ':'.join(parts[5:]) if len(parts) > 5 else ''
+            try:
+                silence = int(parts[3]) if len(parts) > 3 and parts[3] else cls.VIP_DEFAULT_SILENCE_HOURS
+            except ValueError:
+                silence = cls.VIP_DEFAULT_SILENCE_HOURS
+            contacts.append({
+                'name': parts[0],
+                'email': parts[1],
+                'role': parts[2] if len(parts) > 2 else '',
+                'max_silence_hours': silence,
+                'slack_user_id': parts[4] if len(parts) > 4 and parts[4] else None,
+                'notion_page_url': notion_url or None,
+            })
         return contacts
 
     @classmethod

@@ -125,6 +125,7 @@ class Database:
                     name TEXT NOT NULL,
                     email TEXT,
                     slack_user_id TEXT,
+                    notion_page_url TEXT,
                     role TEXT,
                     max_silence_hours INTEGER DEFAULT 48,
                     last_contact_at TIMESTAMP,
@@ -135,6 +136,11 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            # Add notion_page_url column to existing databases (safe migration)
+            try:
+                cursor.execute('ALTER TABLE vip_contacts ADD COLUMN notion_page_url TEXT')
+            except Exception:
+                pass  # Column already exists
 
             # CEO Co-pilot: Projects tracking
             cursor.execute('''
@@ -464,16 +470,32 @@ class Database:
             return row['id'] if row else cursor.lastrowid
 
     def add_vip_contact(self, name: str, email: str = None, slack_user_id: str = None,
-                        role: str = None, max_silence_hours: int = 48, notes: str = None) -> int:
+                        role: str = None, max_silence_hours: int = 48, notes: str = None,
+                        notion_page_url: str = None) -> int:
         """Add a new VIP contact."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT OR REPLACE INTO vip_contacts
-                (name, email, slack_user_id, role, max_silence_hours, notes)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (name, email, slack_user_id, role, max_silence_hours, notes))
+                (name, email, slack_user_id, notion_page_url, role, max_silence_hours, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (name, email, slack_user_id, notion_page_url, role, max_silence_hours, notes))
             return cursor.lastrowid
+
+    def update_vip_contact(self, contact_id: int, **kwargs):
+        """Update specific fields on a VIP contact."""
+        allowed = {'name', 'email', 'slack_user_id', 'notion_page_url', 'role',
+                   'max_silence_hours', 'notes', 'active'}
+        fields = {k: v for k, v in kwargs.items() if k in allowed}
+        if not fields:
+            return
+        set_clause = ', '.join(f'{k} = ?' for k in fields)
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f'UPDATE vip_contacts SET {set_clause} WHERE id = ?',
+                list(fields.values()) + [contact_id]
+            )
 
     def get_all_vip_contacts(self) -> List[Dict]:
         """Get all active VIP contacts."""
